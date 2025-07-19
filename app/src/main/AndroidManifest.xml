@@ -1,0 +1,20 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dl.m3u8recorder">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:allowBackup="true"
+        android:icon="@android:drawable/ic_menu_camera"
+        android:label="M3U8 Recorder"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.M3U8Recorder">
+        <activity android:name=".ui.TaskActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <service android:name=".service.DownloadService"/>
+    </application>
+</manifest>

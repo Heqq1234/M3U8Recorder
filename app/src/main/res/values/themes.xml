@@ -1,0 +1,5 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.M3U8Recorder" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- 占位主题，Compose 不使用这里 -->
+    </style>
+</resources>
