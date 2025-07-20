@@ -5,6 +5,7 @@ import android.util.Log
 import com.dl.m3u8recorder.downloader.M3U8Downloader
 import com.dl.m3u8recorder.merger.FFmpegStreamMerger
 import com.dl.m3u8recorder.model.DownloadTask
+import com.dl.m3u8recorder.record.LiveStreamRecorder
 import com.dl.m3u8recorder.utils.MediaStoreSaver
 import kotlinx.coroutines.*
 import java.io.File
@@ -27,12 +28,13 @@ object DownloadManager {
         listener = taskListener
     }
 
-    fun addTask(url: String, fileName: String, realtimeMerge: Boolean = true) {
+    fun addTask(url: String, fileName: String, realtimeMerge: Boolean = true, isLive: Boolean = false) {
         val task = DownloadTask(
             id = "task_${System.currentTimeMillis()}",
             url = url,
             fileName = fileName,
-            realtimeMerge = realtimeMerge
+            realtimeMerge = realtimeMerge,
+            isLive = isLive
         )
         taskQueue.add(task)
         listener?.onQueueChanged(taskQueue.toList())
@@ -73,22 +75,31 @@ object DownloadManager {
 
         val job = CoroutineScope(Dispatchers.IO).launch {
             try {
-                if (task.realtimeMerge) {
-                    val merger = FFmpegStreamMerger(outputFile)
-                    downloader.startDownloadWithRealtimeMerge(task, merger)
+                if (task.isLive) {
+                    // 直播流录制
+                    val recorder = LiveStreamRecorder(appContext)
+                    recorder.startRecording(task) { updatedTask ->
+                        listener?.onTaskUpdated(updatedTask)
+                    }
+                    // 注意：这里录制是异步执行，视需求你可以改造成挂起函数或者管理好生命周期
                 } else {
-                    // 可实现传统模式：先下载所有 ts，后合并
-                    downloader.downloadAllTsThenMerge(task, outputFile) // ✅ 新增逻辑
+                    // 非直播，走传统下载合并逻辑
+                    if (task.realtimeMerge) {
+                        val merger = FFmpegStreamMerger(outputFile)
+                        downloader.startDownloadWithRealtimeMerge(task, merger)
+                    } else {
+                        downloader.downloadAllTsThenMerge(task, outputFile)
+                    }
+                    listener?.onTaskUpdated(task)
                 }
                 Log.d(TAG, "任务完成: ${task.id}")
             } catch (e: Exception) {
                 Log.e(TAG, "下载任务失败: ${task.id}", e)
             } finally {
                 activeJobs.remove(task.id)
-                if (!task.isCancelled) {
+                if (!task.isCancelled && !task.isLive) {
                     MediaStoreSaver.saveToMediaStore(appContext, outputFile, task.fileName)
                 }
-                listener?.onTaskUpdated(task)
             }
         }
 

@@ -8,7 +8,9 @@ data class DownloadTask(
     val id: String,
     val url: String,
     val fileName: String,
-    val realtimeMerge: Boolean = true, // ✅ 新增字段
+    val realtimeMerge: Boolean = false,
+    val isLive: Boolean = false,
     var isCancelled: Boolean = false,
-    var isPaused: Boolean = false
+    var isPaused: Boolean = false,
+    var statusMessage: String? = null
 ) : Parcelable

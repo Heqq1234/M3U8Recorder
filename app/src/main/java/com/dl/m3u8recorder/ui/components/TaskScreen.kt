@@ -18,6 +18,7 @@ fun TaskScreen() {
     var url by remember { mutableStateOf("") }
     var filename by remember { mutableStateOf("") }
     var realtimeMerge by remember { mutableStateOf(true) }
+    var isLive by remember { mutableStateOf(false) }  // 新增直播流开关
 
     LaunchedEffect(Unit) {
         val dir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.cacheDir
@@ -56,12 +57,22 @@ fun TaskScreen() {
             Text(text = if (realtimeMerge) "边下载边合并 (实时)" else "下载完再合并")
         }
 
+        Row(
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            modifier = Modifier.padding(top = 8.dp)
+        ) {
+            Checkbox(checked = isLive, onCheckedChange = { isLive = it })
+            Text(text = "直播流录制")
+        }
+
         Button(
             onClick = {
                 if (url.isNotBlank() && filename.isNotBlank()) {
-                    DownloadManager.addTask(url, filename, realtimeMerge)
+                    DownloadManager.addTask(url, filename, realtimeMerge, isLive)
                     url = ""
                     filename = ""
+                    realtimeMerge = true
+                    isLive = false
                 }
             },
             modifier = Modifier

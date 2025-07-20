@@ -24,13 +24,14 @@ fun TaskItem(
             Text("文件名: ${task.fileName}")
             Text("链接: ${task.url}")
             Text("合并方式: ${if (task.realtimeMerge) "边下载边合并" else "下载完再合并"}")
-            if (task.isCancelled) {
-                Text("状态: 已取消", color = MaterialTheme.colorScheme.error)
-            } else if (task.isPaused) {
-                Text("状态: 已暂停")
-            } else {
-                Text("状态: 下载中或等待中")
-            }
+            Text("是否直播: ${if (task.isLive) "是" else "否"}")
+            Text("状态: ${
+                task.statusMessage?.ifBlank { when {
+                    task.isCancelled -> "已取消"
+                    task.isPaused -> "已暂停"
+                    else -> "下载中或等待中"
+                }}
+            }")
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Button(onClick = onPause) { Text("暂停") }
