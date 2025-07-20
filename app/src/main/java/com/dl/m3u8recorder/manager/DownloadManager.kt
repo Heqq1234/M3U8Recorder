@@ -59,15 +59,23 @@ object DownloadManager {
         }
     }
 
-    fun retryTask(taskId: String) {
+    fun resumeTask(taskId: String) {
         val task = taskQueue.find { it.id == taskId }
-        if (task != null) {
-            task.isCancelled = false
+        if (task != null && task.isPaused) {
             task.isPaused = false
             startDownloadIfIdle(task)
         }
     }
-
+    fun retryTask(taskId: String) {
+        val task = taskQueue.find { it.id == taskId }
+        if (task != null) {
+            // 统一的重试逻辑
+            task.isCancelled = false
+            task.isPaused = false
+            listener?.onTaskUpdated(task)
+            startDownloadIfIdle(task)
+        }
+    }
     private fun startDownloadIfIdle(task: DownloadTask) {
         if (activeJobs.containsKey(task.id)) return
 
@@ -75,13 +83,17 @@ object DownloadManager {
 
         val job = CoroutineScope(Dispatchers.IO).launch {
             try {
+                // 设置初始状态
+                task.statusMessage = "准备开始下载"
+                task.progress = 0
+                listener?.onTaskUpdated(task)
+
                 if (task.isLive) {
                     // 直播流录制
                     val recorder = LiveStreamRecorder(appContext)
                     recorder.startRecording(task) { updatedTask ->
                         listener?.onTaskUpdated(updatedTask)
                     }
-                    // 注意：这里录制是异步执行，视需求你可以改造成挂起函数或者管理好生命周期
                 } else {
                     // 非直播，走传统下载合并逻辑
                     if (task.realtimeMerge) {
@@ -90,11 +102,16 @@ object DownloadManager {
                     } else {
                         downloader.downloadAllTsThenMerge(task, outputFile)
                     }
-                    listener?.onTaskUpdated(task)
                 }
+
+                task.statusMessage = "下载完成"
+                listener?.onTaskUpdated(task)
                 Log.d(TAG, "任务完成: ${task.id}")
+
             } catch (e: Exception) {
+                task.statusMessage = "下载失败"
                 Log.e(TAG, "下载任务失败: ${task.id}", e)
+                listener?.onTaskUpdated(task)
             } finally {
                 activeJobs.remove(task.id)
                 if (!task.isCancelled && !task.isLive) {

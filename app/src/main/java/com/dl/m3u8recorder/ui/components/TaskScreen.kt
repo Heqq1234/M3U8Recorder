@@ -1,5 +1,6 @@
 package com.dl.m3u8recorder.ui.components
 
+import TaskItem
 import android.os.Environment
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -20,6 +21,7 @@ fun TaskScreen() {
     var realtimeMerge by remember { mutableStateOf(true) }
     var isLive by remember { mutableStateOf(false) }  // 新增直播流开关
 
+    // 初始化 DownloadManager 并监听任务状态变化
     LaunchedEffect(Unit) {
         val dir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.cacheDir
         DownloadManager.init(context, dir, object : DownloadManager.TaskListener {
@@ -36,12 +38,15 @@ fun TaskScreen() {
     }
 
     Column(modifier = Modifier.padding(16.dp)) {
+        // 输入 M3U8 链接
         OutlinedTextField(
             value = url,
             onValueChange = { url = it },
             label = { Text("M3U8链接") },
             modifier = Modifier.fillMaxWidth()
         )
+
+        // 输入文件名
         OutlinedTextField(
             value = filename,
             onValueChange = { filename = it },
@@ -49,6 +54,7 @@ fun TaskScreen() {
             modifier = Modifier.fillMaxWidth()
         )
 
+        // 合并方式选项
         Row(
             verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
             modifier = Modifier.padding(top = 8.dp)
@@ -57,6 +63,7 @@ fun TaskScreen() {
             Text(text = if (realtimeMerge) "边下载边合并 (实时)" else "下载完再合并")
         }
 
+        // 直播流选项
         Row(
             verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
             modifier = Modifier.padding(top = 8.dp)
@@ -65,6 +72,7 @@ fun TaskScreen() {
             Text(text = "直播流录制")
         }
 
+        // 添加下载任务按钮
         Button(
             onClick = {
                 if (url.isNotBlank() && filename.isNotBlank()) {
@@ -82,8 +90,10 @@ fun TaskScreen() {
             Text("添加下载任务")
         }
 
+        // 分隔线
         Divider(modifier = Modifier.padding(vertical = 8.dp))
 
+        // 任务列表
         LazyColumn {
             items(taskList.size) { index ->
                 val task = taskList[index]
@@ -91,7 +101,10 @@ fun TaskScreen() {
                     task = task,
                     onCancel = { DownloadManager.cancelTask(task.id) },
                     onRetry = { DownloadManager.retryTask(task.id) },
-                    onPause = { DownloadManager.pauseTask(task.id) }
+                    onPause = { DownloadManager.pauseTask(task.id) },
+                    onResume = { DownloadManager.resumeTask(task.id) }, // 通过按钮恢复下载
+                    progress = task.progress, // 显示进度
+                    statusMessage = task.statusMessage // 显示状态信息
                 )
             }
         }
