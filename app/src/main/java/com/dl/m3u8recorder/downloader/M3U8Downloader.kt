@@ -5,11 +5,15 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.dl.m3u8recorder.merger.FFmpegStreamMerger
 import com.dl.m3u8recorder.model.DownloadTask
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.IOException
+import kotlin.math.roundToInt
+
+typealias ProgressCallback = (progress: Int, statusMessage: String) -> Unit
 
 class M3U8Downloader(
     private val client: OkHttpClient = OkHttpClient()
@@ -18,20 +22,28 @@ class M3U8Downloader(
 
     suspend fun startDownloadWithRealtimeMerge(
         task: DownloadTask,
-        merger: FFmpegStreamMerger
+        merger: FFmpegStreamMerger,
+        onProgress: ProgressCallback
     ) = withContext(Dispatchers.IO) {
         try {
+            onProgress(0, "解析M3U8链接...")
             val tsUrls = parseM3U8(task.url)
             if (tsUrls.isEmpty()) {
                 Log.e(TAG, "M3U8 无有效分片")
+                onProgress(0, "M3U8解析失败或无分片")
                 return@withContext
             }
 
             merger.startMerge()
+            onProgress(0, "开始实时合并...")
+
+            val totalTsCount = tsUrls.size
+            var downloadedTsCount = 0
 
             for ((index, tsUrl) in tsUrls.withIndex()) {
-                if (task.isCancelled) {
-                    Log.w(TAG, "任务被取消")
+                if (!isActive || task.isCancelled || task.isPaused) {
+                    Log.w(TAG, "任务被取消或暂停，停止实时下载")
+                    onProgress(task.progress, if (task.isCancelled) "已取消" else "已暂停")
                     break
                 }
 
@@ -39,17 +51,28 @@ class M3U8Downloader(
                     val tsData = downloadTs(tsUrl)
                     if (tsData != null) {
                         merger.feed(tsData)
+                        downloadedTsCount++
+                        val currentProgress = ((downloadedTsCount * 100.0) / totalTsCount).roundToInt()
+                        onProgress(
+                            currentProgress.coerceIn(0, 99),
+                            "下载分片 ${downloadedTsCount}/${totalTsCount}"
+                        )
                         Log.d(TAG, "下载完成分片[$index]: $tsUrl")
+                    } else {
+                        Log.w(TAG, "分片下载失败或为空: $tsUrl")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "下载失败: $tsUrl", e)
+                    Log.e(TAG, "下载分片异常: $tsUrl", e)
+                    onProgress(task.progress, "下载分片失败: ${index + 1}/${totalTsCount}")
                 }
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "解析或下载过程异常", e)
+            Log.e(TAG, "实时下载或解析过程异常", e)
+            onProgress(task.progress, "下载错误: ${e.localizedMessage ?: "未知错误"}")
         } finally {
             merger.finish()
+            Log.d(TAG, "实时合并结束")
         }
     }
 
@@ -57,7 +80,7 @@ class M3U8Downloader(
         try {
             val request = Request.Builder().url(m3u8Url).build()
             val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: return@withContext emptyList()
+            val body = response.body?.string() ?: throw IOException("M3U8响应体为空")
 
             val baseUrl = m3u8Url.substringBeforeLast("/") + "/"
 
@@ -69,7 +92,7 @@ class M3U8Downloader(
                 }
         } catch (e: IOException) {
             Log.e(TAG, "解析 M3U8 失败", e)
-            return@withContext emptyList()
+            throw e
         }
     }
 
@@ -88,46 +111,99 @@ class M3U8Downloader(
             return@withContext null
         }
     }
-    suspend fun downloadAllTsThenMerge(task: DownloadTask, outputFile: File) = withContext(Dispatchers.IO) {
-        val tsUrls = parseM3U8(task.url)
-        if (tsUrls.isEmpty()) return@withContext
 
-        val tempDir = File(outputFile.parentFile, task.id)
+    suspend fun downloadAllTsThenMerge(
+        task: DownloadTask,
+        outputFile: File,
+        onProgress: ProgressCallback
+    ) = withContext(Dispatchers.IO) {
+        onProgress(0, "解析M3U8链接...")
+        val tsUrls = try {
+            parseM3U8(task.url)
+        } catch (e: Exception) {
+            onProgress(0, "M3U8解析失败")
+            Log.e(TAG, "M3U8 解析失败", e)
+            return@withContext
+        }
+
+        if (tsUrls.isEmpty()) {
+            onProgress(0, "M3U8无有效分片")
+            return@withContext
+        }
+
+        val tempDir = File(outputFile.parentFile, "temp_${task.id}")
         if (!tempDir.exists()) tempDir.mkdirs()
         val tsFiles = mutableListOf<File>()
 
-        for ((index, tsUrl) in tsUrls.withIndex()) {
-            if (task.isCancelled || task.isPaused) break
+        val totalTsCount = tsUrls.size
+        var downloadedTsCount = 0
 
-            val tsData = downloadTs(tsUrl) ?: continue
-            val tsFile = File(tempDir, "part_$index.ts")
-            tsFile.writeBytes(tsData)
-            tsFiles.add(tsFile)
+        for ((index, tsUrl) in tsUrls.withIndex()) {
+            if (!isActive || task.isCancelled || task.isPaused) {
+                Log.w(TAG, "任务被取消或暂停，停止分片下载")
+                onProgress(task.progress, if (task.isCancelled) "已取消" else "已暂停")
+                break
+            }
+
+            try {
+                val tsData = downloadTs(tsUrl)
+                if (tsData != null) {
+                    val tsFile = File(tempDir, "part_$index.ts")
+                    tsFile.writeBytes(tsData)
+                    tsFiles.add(tsFile)
+                    downloadedTsCount++
+
+                    val downloadProgress = ((downloadedTsCount * 90.0) / totalTsCount).roundToInt()
+                    onProgress(
+                        downloadProgress.coerceIn(0, 90),
+                        "下载分片 ${downloadedTsCount}/${totalTsCount}"
+                    )
+                    Log.d(TAG, "下载完成分片并保存: ${tsFile.name}")
+                } else {
+                    Log.w(TAG, "分片下载失败或为空: $tsUrl")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "保存分片异常: $tsUrl", e)
+                onProgress(task.progress, "保存分片失败: ${index + 1}/${totalTsCount}")
+            }
         }
 
-        if (tsFiles.isEmpty()) return@withContext
+        if (tsFiles.isEmpty() || task.isCancelled || task.isPaused) {
+            Log.w(TAG, "无分片可合并或任务被中断")
+            if (tempDir.exists()) tempDir.deleteRecursively()
+            return@withContext
+        }
 
-        // 创建 concat.txt
+        onProgress(90, "开始合并分片...")
+
         val concatFile = File(tempDir, "concat.txt").apply {
             writeText(tsFiles.joinToString("\n") { "file '${it.absolutePath}'" })
         }
 
-        // 构造 FFmpeg 命令
         val command = "-y -f concat -safe 0 -i ${concatFile.absolutePath} -c copy ${outputFile.absolutePath}"
-        Log.d("M3U8Downloader", "执行 FFmpeg 合并命令: $command")
+        Log.d(TAG, "执行 FFmpeg 合并命令: $command")
 
-        // 执行合并
-        val session = FFmpegKit.execute(command)
+        try {
+            val session = FFmpegKit.execute(command)
 
-        if (session.returnCode.isSuccess) {
-            Log.d("M3U8Downloader", "合并成功，输出: ${outputFile.absolutePath}")
-        } else {
-            Log.e("M3U8Downloader", "合并失败: ${session.failStackTrace}")
+            if (session.returnCode.isSuccess) {
+                onProgress(100, "合并成功")
+                Log.d(TAG, "合并成功，输出: ${outputFile.absolutePath}")
+            } else {
+                val failLog = session.logsAsString
+                onProgress(task.progress, "合并失败")
+                Log.e(TAG, "合并失败: ${session.failStackTrace}\nLog: $failLog")
+                throw IOException("FFmpeg 合并失败")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "FFmpeg 合并异常", e)
+            onProgress(task.progress, "合并异常: ${e.localizedMessage ?: "未知错误"}")
+            throw e
+        } finally {
+            concatFile.delete()
+            tsFiles.forEach { it.delete() }
+            tempDir.deleteRecursively()
+            Log.d(TAG, "临时文件清理完毕")
         }
-
-        // 清理临时文件
-        concatFile.delete()
-        tsFiles.forEach { it.delete() }
-        tempDir.deleteRecursively()
     }
 }

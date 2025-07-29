@@ -1,20 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="com.dl.m3u8recorder">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+
+
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/ic_menu_camera"
+        android:icon="@drawable/file_download"
         android:label="M3U8 Recorder"
         android:usesCleartextTraffic="true"
-        android:theme="@style/Theme.M3U8Recorder">
-        <activity android:name=".ui.TaskActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
-            </intent-filter>
-        </activity>
-        <service android:name=".service.DownloadService"/>
-    </application>
-</manifest>
+        android:theme="@style/Theme.M3U8Recorder"
+        tools:targetApi="31">
+
+    <activity android:name=".ui.TaskActivity"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
+        </intent-filter>
+    </activity>
+
+    <service
+        android:name=".service.LiveRecordingService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="mediaPlayback" />
+</application>
+    </manifest>

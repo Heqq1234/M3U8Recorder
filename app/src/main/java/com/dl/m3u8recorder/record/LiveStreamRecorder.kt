@@ -38,6 +38,8 @@ class LiveStreamRecorder(private val context: Context) {
         task.isPaused = false
         task.statusMessage = "开始录制直播流..."
         task.progress = 0
+        task._downloadedSize.value = 0L // 重置已下载大小
+        task._elapsedTime.value = 0L    // 重置已用时间
         DownloadManager.notifyTaskUpdated(task)
 
         // 获取目标输出 TS 文件路径，考虑自定义目录
@@ -49,10 +51,6 @@ class LiveStreamRecorder(private val context: Context) {
         outputTsFile.parentFile?.mkdirs()
 
         // FFmpeg 命令：直接录制到 TS 文件。
-        // 注意：FFmpeg 对现有文件默认是不会覆盖的，但对于 TS 文件，在某些情况下，
-        // 如果再次以 `-f mpegts` 写入，它会尝试追加，但这取决于FFmpeg版本和具体实现。
-        // 为了确保可靠的追加行为，最佳实践是在停止后进行显式合并（参考之前的讨论）。
-        // 这里暂时移除 -y 参数，让它在文件存在时报错，以便我们能识别。
         val command = listOf(
             "-i", task.url,
             "-c", "copy",
@@ -73,12 +71,13 @@ class LiveStreamRecorder(private val context: Context) {
 
                 if (ReturnCode.isSuccess(rc)) {
                     task.statusMessage = "录制完成 (TS文件已生成): ${outputTsFile.name}"
+                    task.progress = 100 // 录制完成，进度设为100%
+                    // 可以根据最终文件大小更新 task._downloadedSize.value = outputTsFile.length()
+                    // 但通常在 statisticsCallback 中更新更频繁
                     Log.d(TAG, "录制成功 (TS文件已生成): ${task.id}")
                 } else if (ReturnCode.isCancel(rc)) {
                     Log.d(TAG, "录制会话被取消/中断: ${task.id}")
-                    // 如果是暂停，isPaused会在DownloadManager里被设置为true
-                    // 如果是取消，isCancelled会在DownloadManager里被设置为true
-                    // 状态信息由 DownloadManager 统一管理
+                    // 状态信息由 DownloadManager 统一管理 (取消或暂停)
                 } else {
                     task.statusMessage = "录制失败: $rc"
                     task.isCancelled = true // 标记为失败
@@ -92,7 +91,6 @@ class LiveStreamRecorder(private val context: Context) {
             { stats: Statistics ->
                 if (task.isCancelled || task.isPaused) {
                     // 如果任务在 DownloadManager 中被标记为取消或暂停，则停止 FFmpeg 进程
-                    // 这里的 cancel() 调用是必要的，因为 executeAsync 无法直接感知外部状态变化
                     currentFFmpegSession.cancel()
                     return@executeAsync
                 }
@@ -100,11 +98,18 @@ class LiveStreamRecorder(private val context: Context) {
                 val timeMs = stats.time.toLong()
                 val sizeBytes = stats.size
 
-                val elapsedSeconds = timeMs / 1000
-                val simulatedProgress = (elapsedSeconds.toFloat() / 3600 * 99).roundToInt().coerceIn(0, 99) // 假设1小时模拟99%
+                // --- 核心修改：更新 downloadedSize 和 elapsedTime ---
+                task._downloadedSize.value = sizeBytes
+                task._elapsedTime.value = timeMs
+                // --- 核心修改结束 ---
 
+                // 进度条显示为无限加载，所以 progress 可以不用太精确，或者可以基于某种模拟
+                // 这里我们仍然保持一个模拟进度，但UI会显示无限加载动画
+                val simulatedProgress = (timeMs.toFloat() / 3600_000 * 99).roundToInt().coerceIn(0, 99) // 假设1小时模拟99%
                 task.progress = simulatedProgress
-                task.statusMessage = "录制中: ${formatDuration(timeMs)} / ${formatSize(sizeBytes)}"
+
+                // statusMessage 包含了文件大小和时间，但 UI 现在直接显示这些信息
+                task.statusMessage = "下载中" // 简化状态消息，让UI组件显示详细信息
                 DownloadManager.notifyTaskUpdated(task)
             }
         )
@@ -134,7 +139,7 @@ class LiveStreamRecorder(private val context: Context) {
 
         if (!inputTsFile.exists() || inputTsFile.length() == 0L) {
             task.statusMessage = "没有可转换的 TS 文件或文件为空。"
-            task.progress = 100
+            task.progress = 100 // 标记为完成但无文件
             DownloadManager.notifyTaskUpdated(task)
             return
         }
@@ -154,6 +159,8 @@ class LiveStreamRecorder(private val context: Context) {
         if (conversionSession.returnCode.isSuccess) {
             task.statusMessage = "录制完成: ${outputMp4File.name}"
             task.progress = 100
+            task._downloadedSize.value = outputMp4File.length() // 最终文件大小
+            task._elapsedTime.value = conversionSession.duration // 最终转换时间
             Log.d(TAG, "TS 到 MP4 转换成功: ${outputMp4File.absolutePath}")
             inputTsFile.delete() // 成功转换后删除临时的 TS 文件
             // MediaStoreSaver.saveToMediaStore(context, outputMp4File, task.fileName) // 将文件保存到媒体库
@@ -173,6 +180,8 @@ class LiveStreamRecorder(private val context: Context) {
         val session = activeLiveSessions[taskId]
         session?.cancel()
         Log.d(TAG, "发送取消信号给录制会话 (暂停): $taskId")
+        // FFmpegKit 停止后，statisticsCallback 也会停止，所以 _downloadedSize 和 _elapsedTime
+        // 不会再更新，但它们会保留暂停时的最后值。
     }
 
     /**
@@ -182,7 +191,9 @@ class LiveStreamRecorder(private val context: Context) {
     fun resumeRecording(task: DownloadTask) {
         if (!activeLiveSessions.containsKey(task.id)) {
             Log.d(TAG, "恢复录制: ${task.id}")
-            startRecording(task) // 重新启动将追加到现有 TS 文件
+            // 重新启动将追加到现有 TS 文件，FFmpegKit 会自动从文件末尾开始写
+            // _downloadedSize 和 _elapsedTime 会在新的 session 的 statisticsCallback 中重新开始更新
+            startRecording(task)
         } else {
             Log.w(TAG, "录制任务 ${task.id} 已经在运行，无法恢复。")
         }
