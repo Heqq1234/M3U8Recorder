@@ -140,6 +140,7 @@ fun TaskItem(
                 val buttonContentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp) // 更舒适的内边距
                 val buttonTextSize = 13.sp // 统一按钮文本字体大小
 
+                // 始终显示暂停/恢复/取消/停止录制按钮（如果适用）
                 if (currentIsCancelled) {
                     Button(
                         onClick = { onRetry(task.id) },
@@ -147,11 +148,11 @@ fun TaskItem(
                         contentPadding = buttonContentPadding
                     ) { Text("重试", fontSize = buttonTextSize) }
 
-                    OutlinedButton( // 删除按钮使用 OutlinedButton 更柔和
-                        onClick = { showDeleteDialog = true },
-                        modifier = buttonModifier,
-                        contentPadding = buttonContentPadding
-                    ) { Text("删除", fontSize = buttonTextSize) }
+                    // OutlinedButton( // 删除按钮现在统一放在最后
+                    //     onClick = { showDeleteDialog = true },
+                    //     modifier = buttonModifier,
+                    //     contentPadding = buttonContentPadding
+                    // ) { Text("删除", fontSize = buttonTextSize) }
                 } else if (currentIsPaused) {
                     Button(
                         onClick = { onResume(task.id) },
@@ -159,11 +160,11 @@ fun TaskItem(
                         contentPadding = buttonContentPadding
                     ) { Text("恢复", fontSize = buttonTextSize) }
 
-                    OutlinedButton(
-                        onClick = { showDeleteDialog = true },
-                        modifier = buttonModifier,
-                        contentPadding = buttonContentPadding
-                    ) { Text("取消/删除", fontSize = buttonTextSize) }
+                    // OutlinedButton( // 删除按钮现在统一放在最后
+                    //     onClick = { showDeleteDialog = true },
+                    //     modifier = buttonModifier,
+                    //     contentPadding = buttonContentPadding
+                    // ) { Text("取消/删除", fontSize = buttonTextSize) }
                 } else if (currentProgress < 100 && currentStatusMessage == "下载中") {
                     // 正在下载中
                     Button(
@@ -172,11 +173,11 @@ fun TaskItem(
                         contentPadding = buttonContentPadding
                     ) { Text("暂停", fontSize = buttonTextSize) }
 
-                    OutlinedButton(
-                        onClick = { showDeleteDialog = true },
-                        modifier = buttonModifier,
-                        contentPadding = buttonContentPadding
-                    ) { Text("取消/删除", fontSize = buttonTextSize) }
+                    // OutlinedButton( // 删除按钮现在统一放在最后
+                    //     onClick = { showDeleteDialog = true },
+                    //     modifier = buttonModifier,
+                    //     contentPadding = buttonContentPadding
+                    // ) { Text("取消/删除", fontSize = buttonTextSize) }
 
                     if (task.isLive) {
                         OutlinedButton( // 停止录制也用 OutlinedButton
@@ -189,26 +190,27 @@ fun TaskItem(
                     // 🚀 【修改】使用 Box 包裹并居中，解决 Modifier.align 错误
                     Box(
                         modifier = Modifier.fillMaxWidth(), // 让 Box 占据 FlowRow 的全部宽度
-                        contentAlignment = Alignment.Center // Box 的内容居中
+                        contentAlignment = Alignment.CenterStart // Box 的内容从左侧开始排列
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center // 确保 Row 内容在 Box 中也居中
-                        ) {
-                            Text(
-                                text = "任务完成",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.tertiary,
-                                modifier = Modifier.padding(end = 8.dp) // 文本和按钮之间的间距
-                            )
-                            Button(
-                                onClick = { showDeleteDialog = true },
-                                modifier = buttonModifier.width(100.dp), // 固定宽度，避免拉伸
-                                contentPadding = buttonContentPadding
-                            ) { Text("删除", fontSize = buttonTextSize) }
-                        }
+                        Text(
+                            text = "任务完成",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.tertiary
+                            // 移除这里的 paddingEnd，让删除按钮靠近
+                        )
                     }
                 }
+
+                // --- 统一的删除按钮 ---
+                // 不管任务处于什么状态，只要它在列表中就应该可以被删除
+                // 只有当任务状态不是“已完成”时，才显示为“取消/删除”
+                // 否则显示为“删除”
+                val deleteButtonText = if (currentProgress < 100 && !currentIsCancelled) "取消/删除" else "删除"
+                OutlinedButton(
+                    onClick = { showDeleteDialog = true },
+                    modifier = buttonModifier,
+                    contentPadding = buttonContentPadding
+                ) { Text(deleteButtonText, fontSize = buttonTextSize) }
             }
         }
     }
@@ -217,7 +219,7 @@ fun TaskItem(
         AlertDialog(
             onDismissRequest = { showDeleteDialog = false },
             title = { Text("确认删除任务?") },
-            text = { Text("您确定要删除任务 '${task.fileName}' 吗？此操作将删除已下载的 .ts 文件，但不会删除已转换的 .mp4 文件。") },
+            text = { Text("您确定要删除任务 '${task.fileName}' 吗？此操作将停止正在进行的下载/录制，并删除已下载的临时 .ts 文件。已转换的 .mp4 文件不会被删除。") }, // 更新提示信息
             confirmButton = {
                 Button(
                     onClick = {

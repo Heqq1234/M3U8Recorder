@@ -125,7 +125,10 @@ fun TaskScreen(
             onValueChange = { url = it },
             label = { Text("M3U8链接") },
             modifier = Modifier.fillMaxWidth(),
-            singleLine = true // 限制单行
+            //singleLine = true, // 限制单行
+            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                fontSize = 12.sp // 设置更小的字体大小
+            )
         )
         Spacer(modifier = Modifier.height(8.dp)) // 增加间距
         // 文件名输入框

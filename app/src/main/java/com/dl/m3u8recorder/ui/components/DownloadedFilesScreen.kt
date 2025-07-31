@@ -151,12 +151,13 @@ fun DownloadedFilesScreen(
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("类型: ${file.extension.uppercase()}", fontSize = 12.sp, modifier = Modifier.weight(0.3f))
-                                        Text("大小: ${"%.2f MB".format(file.length() / (1024.0 * 1024.0))}", fontSize = 12.sp, modifier = Modifier.weight(0.4f))
+                                        // 🚀 【修改：移除文件类型显示】
+                                        // Text("类型: ${file.extension.uppercase()}", fontSize = 12.sp, modifier = Modifier.weight(0.3f))
+                                        Text("大小: ${"%.2f MB".format(file.length() / (1024.0 * 1024.0))}", fontSize = 12.sp, modifier = Modifier.weight(0.4f)) // 调整权重
                                         Text(
                                             "时间: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(file.lastModified()))}",
                                             fontSize = 12.sp,
-                                            modifier = Modifier.weight(0.6f)
+                                            modifier = Modifier.weight(0.6f) // 调整权重
                                         )
                                     }
                                 }
