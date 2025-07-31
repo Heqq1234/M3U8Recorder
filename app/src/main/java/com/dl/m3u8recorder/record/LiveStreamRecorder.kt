@@ -40,7 +40,6 @@ class LiveStreamRecorder(private val context: Context) {
         task.statusMessage = "开始录制直播流..."
         DownloadManager.notifyTaskUpdated(task)
 
-        // 获取目标输出 TS 文件路径，考虑自定义目录
         val outputTsFile = task.customDownloadUri?.let { uriString ->
             Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), task.fileName, ".ts")
         } ?: Mp4OutputHelper.getOutputFile(context, task.fileName, ".ts")
@@ -48,7 +47,7 @@ class LiveStreamRecorder(private val context: Context) {
         // 确保父目录存在
         outputTsFile.parentFile?.mkdirs()
 
-        // FFmpeg 命令：直接录制到 TS 文件。
+        // FFmpeg 命令：直播流录制到 TS 文件，FFmpeg 在文件已存在时默认会追加。
         val command = listOf(
             "-i", task.url,
             "-c", "copy",
@@ -77,19 +76,19 @@ class LiveStreamRecorder(private val context: Context) {
                     CoroutineScope(Dispatchers.IO).launch {
                         convertTsToMp4(task)
                     }
-
                 } else if (ReturnCode.isCancel(rc)) {
                     Log.d(TAG, "录制会话被用户取消/中断: ${task.id}")
                     task.isCancelled = true
                     task.statusMessage = "已取消"
-
+                    // 用户取消，不进行转换，只清理状态。
+                    // 暂停时也会进入这个分支，但不应该转换。
                 } else {
                     // 可能是直播源断开等原因导致的失败，也触发转换
                     task.statusMessage = "录制意外结束，正在尝试转换..."
                     task.progress = 99
                     Log.e(TAG, "录制失败: ${task.id}, ReturnCode: $rc, 日志: ${completedSession.logsAsString}")
 
-                    // 失败结束，也触发转换
+                    // 失败结束，也触发转换。
                     CoroutineScope(Dispatchers.IO).launch {
                         convertTsToMp4(task)
                     }
@@ -100,7 +99,6 @@ class LiveStreamRecorder(private val context: Context) {
                 Log.d(TAG, "FFmpeg 日志: ${log.message}")
             },
             { stats: Statistics ->
-                // 移除此处直接取消会话的逻辑
                 val timeMs = stats.time.toLong()
                 val sizeBytes = stats.size
 
@@ -114,27 +112,23 @@ class LiveStreamRecorder(private val context: Context) {
                 DownloadManager.notifyTaskUpdated(task)
             }
         )
-
         currentFFmpegSession = session
         activeLiveSessions[task.id] = currentFFmpegSession
     }
 
     /**
      * 将已累积的 TS 文件转换为最终的 MP4 文件。
+     * **关键修改点：每次转换都生成一个带时间戳的新文件**
      */
     private suspend fun convertTsToMp4(task: DownloadTask) {
         task.statusMessage = "正在转换为 MP4 格式..."
         task.progress = 99
         DownloadManager.notifyTaskUpdated(task)
 
-        // 获取输入 TS 和输出 MP4 文件
+        // 获取输入 TS 文件
         val inputTsFile = task.customDownloadUri?.let { uriString ->
             Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), task.fileName, ".ts")
         } ?: Mp4OutputHelper.getOutputFile(context, task.fileName, ".ts")
-
-        val outputMp4File = task.customDownloadUri?.let { uriString ->
-            Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), task.fileName, ".mp4")
-        } ?: Mp4OutputHelper.getOutputFile(context, task.fileName, ".mp4")
 
         if (!inputTsFile.exists() || inputTsFile.length() == 0L) {
             task.statusMessage = "没有可转换的 TS 文件或文件为空。"
@@ -143,8 +137,15 @@ class LiveStreamRecorder(private val context: Context) {
             return
         }
 
+        // 动态生成带时间戳的新文件名，避免覆盖
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        val outputMp4FileName = "${task.fileName}_$timestamp.mp4"
+
+        val outputMp4File = task.customDownloadUri?.let { uriString ->
+            Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), outputMp4FileName, "")
+        } ?: Mp4OutputHelper.getOutputFile(context, outputMp4FileName, "")
+
         val convertCommand = listOf(
-            "-y",
             "-i", inputTsFile.absolutePath,
             "-c", "copy",
             "-movflags", "+faststart",
@@ -173,17 +174,22 @@ class LiveStreamRecorder(private val context: Context) {
 
     /**
      * 暂停录制。仅停止 FFmpeg 进程，保留已录制的 TS 文件。
-     * @param taskId 要暂停的任务 ID。
      */
     fun pauseRecording(taskId: String) {
         val session = activeLiveSessions[taskId]
         session?.cancel()
         Log.d(TAG, "发送取消信号给录制会话 (暂停): $taskId")
+
+        val task = DownloadManager.getTasks().find { it.id == taskId }
+        if (task != null) {
+            task.isPaused = true
+            task.statusMessage = "已暂停"
+            DownloadManager.notifyTaskUpdated(task)
+        }
     }
 
     /**
      * 恢复录制。重新启动 FFmpeg 进程，继续向现有 TS 文件追加。
-     * @param task 要恢复的 DownloadTask 对象。
      */
     fun resumeRecording(task: DownloadTask) {
         if (!activeLiveSessions.containsKey(task.id)) {
@@ -196,8 +202,6 @@ class LiveStreamRecorder(private val context: Context) {
 
     /**
      * 停止录制 (由用户明确触发，例如点击“停止”按钮)。
-     * 停止 FFmpeg 进程并触发最终的 TS 到 MP4 转换。
-     * @param taskId 要停止的任务 ID。
      */
     fun stopRecording(taskId: String) {
         val session = activeLiveSessions[taskId]
