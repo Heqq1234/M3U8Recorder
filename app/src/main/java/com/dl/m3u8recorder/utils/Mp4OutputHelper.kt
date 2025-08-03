@@ -31,21 +31,8 @@ object Mp4OutputHelper {
      * @return File 对象
      */
     fun getOutputFileFromUri(context: Context, uri: Uri, fileName: String, extension: String): File {
-        // 对于通过 DocumentProvider 获取的 Uri，我们不能直接构造 File 对象来写入
-        // FFmpegKit 需要一个实际的文件路径。
-        // 所以这里的策略是：将文件仍然写到应用的私有缓存目录，然后通过 MediaStoreSaver 移动。
-        // 或者，更直接的方式是，如果自定义目录是一个直接的文件系统路径（例如通过旧版存储访问框架获取），
-        // 那么可以直接使用。但 DocumentProvider URI 通常不是。
-        //
-        // 鉴于 FFmpegKit 期望一个直接的文件路径，我们无法直接用 DocumentProvider Uri 作为其输出。
-        // 最常见的做法是：FFmpeg 写入到应用的内部/外部私有缓存目录，然后应用再使用 SAF 将文件移动到用户选择的目录。
-
-        // **重要：为了兼容 FFmpegKit，我们暂时仍然让 FFmpeg 写入到应用私有目录，
-        // 然后在任务完成时，由 DownloadManager 负责将其移动到用户指定的目录（MediaStoreSaver）。**
-        // 这样，FFmpegKit 就能正常工作，并且我们能将文件保存到用户指定的位置。
-
-        // 在这里，我们仍然返回一个在应用私有目录的文件路径，用于 FFmpeg 的输出。
-        // 最终文件的移动逻辑会发生在 DownloadManager -> MediaStoreSaver。
+        // 为了兼容 FFmpegKit，我们暂时仍然让 FFmpeg 写入到应用私有目录，
+        // 然后在任务完成时，由 DownloadManager 负责将其移动到用户指定的目录（MediaStoreSaver）。
         val directory = getAppSpecificDownloadsDir(context) // FFmpeg 实际写入的临时目录
         return File(directory, fileName + extension)
     }
@@ -88,7 +75,6 @@ object Mp4OutputHelper {
     fun getUriPath(context: Context, uri: Uri): String? {
         try {
             val docId = DocumentsContract.getTreeDocumentId(uri)
-            // Example: "primary:Download/MyVideos"
             val split = docId.split(":")
             if (split.size == 2) {
                 val type = split[0]
@@ -96,7 +82,6 @@ object Mp4OutputHelper {
 
                 return when (type) {
                     "primary" -> "${Environment.getExternalStorageDirectory().absolutePath}/$path"
-                    // Handle other document provider types if necessary, e.g., external SD cards
                     else -> null
                 }
             }

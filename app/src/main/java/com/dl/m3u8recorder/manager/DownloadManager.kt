@@ -12,7 +12,6 @@ import com.dl.m3u8recorder.service.LiveRecordingService
 import com.dl.m3u8recorder.utils.MediaStoreSaver
 import com.dl.m3u8recorder.utils.Mp4OutputHelper
 import kotlinx.coroutines.*
-import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -27,6 +26,7 @@ object DownloadManager {
 
     @SuppressLint("StaticFieldLeak") // 针对 appContext 和 liveStreamRecorder 的静态引用警告
     private lateinit var appContext: Context
+    @SuppressLint("StaticFieldLeak")
     lateinit var liveStreamRecorder: LiveStreamRecorder // 用于直播任务的录制器
 
     // 监听器列表，使用 CopyOnWriteArrayList 保证在迭代时修改的线程安全
@@ -45,8 +45,9 @@ object DownloadManager {
     fun addListener(listener: TaskListener) {
         if (!listeners.contains(listener)) {
             listeners.add(listener)
-            // 新监听器添加时，立即通知当前所有任务状态
-            listener.onQueueChanged(currentTasksState.values.toList())
+            // 同样，在这里也发送排序后的列表
+            val sortedList = currentTasksState.values.toList().sortedByDescending { it.id }
+            listener.onQueueChanged(sortedList)
             Log.d(TAG, "Listener added: ${listener.javaClass.simpleName}. Total listeners: ${listeners.size}")
         }
     }
@@ -83,10 +84,11 @@ object DownloadManager {
             Log.w(TAG, "Attempted to update task ${updatedTaskFromSource.id} but it's not in DownloadManager's active tasks.")
         }
     }
-
-    // 通知所有监听器任务队列整体发生变化（例如增删任务）
     private fun notifyQueueChanged() {
-        listeners.forEach { it.onQueueChanged(currentTasksState.values.toList()) }
+        // 在通知监听器之前，对任务列表进行排序。
+        // 使用 .sortedByDescending { it.id } 可以让最新的任务排在列表的最前面。
+        val sortedList = currentTasksState.values.toList().sortedByDescending { it.id }
+        listeners.forEach { it.onQueueChanged(sortedList) }
     }
 
     /**
@@ -133,7 +135,7 @@ object DownloadManager {
                 // 立即更新任务状态，给用户即时反馈
                 task.statusMessage = "准备开始下载"
                 task.progress = 0
-                // 【关键修改】重置下载大小和时间，以防是重试任务
+                // 重置下载大小和时间，以防是重试任务
                 task._downloadedSize.value = 0L
                 task._elapsedTime.value = 0L
                 notifyTaskUpdated(task)
