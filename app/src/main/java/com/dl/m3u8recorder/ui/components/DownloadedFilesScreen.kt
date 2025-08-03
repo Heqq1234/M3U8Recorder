@@ -25,28 +25,24 @@ import com.dl.m3u8recorder.utils.Mp4OutputHelper
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlinx.coroutines.Dispatchers // 导入 Dispatchers
-import kotlinx.coroutines.launch // 导入 launch
-import kotlinx.coroutines.withContext // 导入 withContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun DownloadedFilesScreen(
     onFileClick: (Uri) -> Unit,
-    // onConvertToMp4: (File) -> Unit // 如果暂时不需要这个功能，可以先注释掉
 ) {
     val context = LocalContext.current
     val downloadedFiles = remember { mutableStateListOf<File>() }
     val selectedFiles = remember { mutableStateListOf<File>() }
     var inSelectionMode by remember { mutableStateOf(false) }
 
-    // 🚀 【新增状态】控制确认删除对话框的显示
     var showDeleteConfirmationDialog by remember { mutableStateOf(false) }
-    // 🚀 【新增状态】控制加载指示器的显示
     var isDeleting by remember { mutableStateOf(false) }
-    val coroutineScope = rememberCoroutineScope() // 获取协程作用域
+    val coroutineScope = rememberCoroutineScope()
 
-    // 加载文件列表的函数
     val loadFiles: () -> Unit = {
         val appDownloadsDir = Mp4OutputHelper.getAppSpecificDownloadsDir(context)
         Log.d("DownloadedFilesScreen", "Scanning directory: ${appDownloadsDir.absolutePath}")
@@ -58,7 +54,6 @@ fun DownloadedFilesScreen(
 
         downloadedFiles.clear()
         downloadedFiles.addAll(files.sortedByDescending { it.lastModified() })
-        // 刷新列表时清空选中状态
         selectedFiles.clear()
         inSelectionMode = false
         Log.d("DownloadedFilesScreen", "Found ${downloadedFiles.size} .mp4 and .ts files.")
@@ -75,7 +70,6 @@ fun DownloadedFilesScreen(
                     title = { Text("已选中 ${selectedFiles.size} 项") },
                     navigationIcon = {
                         IconButton(onClick = {
-                            // 取消选择模式
                             selectedFiles.clear()
                             inSelectionMode = false
                         }) {
@@ -85,7 +79,6 @@ fun DownloadedFilesScreen(
                     actions = {
                         if (selectedFiles.isNotEmpty()) {
                             IconButton(onClick = {
-                                // 🚀 【修改】点击删除时显示确认对话框
                                 showDeleteConfirmationDialog = true
                             }) {
                                 Icon(Icons.Default.Delete, contentDescription = "删除选中文件")
@@ -100,8 +93,8 @@ fun DownloadedFilesScreen(
             }
         }
     ) { innerPadding ->
-        Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) { // 使用 Box 包装内容，方便覆盖加载指示器
-            Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+        Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+            Column(modifier = Modifier.padding(horizontal = 8.dp)) { // 缩小左右内边距
                 if (downloadedFiles.isEmpty()) {
                     Text("没有找到已下载或已转换的视频文件。", modifier = Modifier.padding(top = 16.dp))
                 } else {
@@ -113,7 +106,7 @@ fun DownloadedFilesScreen(
                             Card(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 4.dp)
+                                    .padding(vertical = 2.dp) // 缩小任务条之间的垂直间距
                                     .combinedClickable(
                                         onClick = {
                                             if (inSelectionMode) {
@@ -143,21 +136,20 @@ fun DownloadedFilesScreen(
                                 elevation = CardDefaults.cardElevation(2.dp),
                                 colors = CardDefaults.cardColors(containerColor = cardBackgroundColor)
                             ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Text("文件名: ${file.name}", fontSize = 14.sp)
+                                Column(modifier = Modifier.padding(8.dp)) { // 缩小卡片内部的内边距
+                                    Text("文件名: ${file.name}", fontSize = 12.sp) // 缩小字体
+                                    Spacer(modifier = Modifier.height(2.dp)) // 缩小间距
 
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        // 🚀 【修改：移除文件类型显示】
-                                        // Text("类型: ${file.extension.uppercase()}", fontSize = 12.sp, modifier = Modifier.weight(0.3f))
-                                        Text("大小: ${"%.2f MB".format(file.length() / (1024.0 * 1024.0))}", fontSize = 12.sp, modifier = Modifier.weight(0.4f)) // 调整权重
+                                        Text("大小: ${"%.2f MB".format(file.length() / (1024.0 * 1024.0))}", fontSize = 10.sp, modifier = Modifier.weight(0.4f)) // 缩小字体
                                         Text(
                                             "时间: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(file.lastModified()))}",
-                                            fontSize = 12.sp,
-                                            modifier = Modifier.weight(0.6f) // 调整权重
+                                            fontSize = 10.sp, // 缩小字体
+                                            modifier = Modifier.weight(0.6f)
                                         )
                                     }
                                 }
@@ -167,11 +159,9 @@ fun DownloadedFilesScreen(
                 }
             }
 
-            // 🚀 【删除确认对话框】
             if (showDeleteConfirmationDialog) {
                 AlertDialog(
                     onDismissRequest = {
-                        // 点击对话框外部或按返回键时关闭对话框
                         showDeleteConfirmationDialog = false
                     },
                     title = { Text("确认删除？") },
@@ -180,10 +170,10 @@ fun DownloadedFilesScreen(
                         Button(
                             onClick = {
                                 showDeleteConfirmationDialog = false
-                                isDeleting = true // 🚀 【显示加载指示器】
+                                isDeleting = true
                                 coroutineScope.launch {
                                     var deletedCount = 0
-                                    withContext(Dispatchers.IO) { // 在IO线程执行文件删除操作
+                                    withContext(Dispatchers.IO) {
                                         selectedFiles.forEach { fileToDelete ->
                                             if (fileToDelete.exists()) {
                                                 if (fileToDelete.delete()) {
@@ -195,10 +185,10 @@ fun DownloadedFilesScreen(
                                             }
                                         }
                                     }
-                                    withContext(Dispatchers.Main) { // 回到主线程更新UI
-                                        isDeleting = false // 🚀 【隐藏加载指示器】
+                                    withContext(Dispatchers.Main) {
+                                        isDeleting = false
                                         Toast.makeText(context, "成功删除 $deletedCount 个文件。", Toast.LENGTH_SHORT).show()
-                                        loadFiles() // 刷新列表
+                                        loadFiles()
                                     }
                                 }
                             }
@@ -218,9 +208,7 @@ fun DownloadedFilesScreen(
                 )
             }
 
-            // 🚀 【加载指示器】
             if (isDeleting) {
-                // 半透明背景，防止用户点击其他地方
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = Color.Black.copy(alpha = 0.5f)
@@ -233,7 +221,7 @@ fun DownloadedFilesScreen(
                         Text(
                             text = "正在删除文件...",
                             color = Color.White,
-                            modifier = Modifier.padding(top = 80.dp) // 调整位置
+                            modifier = Modifier.padding(top = 80.dp)
                         )
                     }
                 }

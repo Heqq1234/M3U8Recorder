@@ -16,13 +16,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.navigation.NavController
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.dl.m3u8recorder.ui.components.AppNavHost
-import com.dl.m3u8recorder.ui.components.Routes // 导入 Routes
+import com.dl.m3u8recorder.ui.components.Routes
 import com.dl.m3u8recorder.ui.theme.AppTheme
 
 // 定义一个密封类，用于表示底部导航栏的每个项目
@@ -39,35 +38,35 @@ class TaskActivity : ComponentActivity() {
                 val navController = rememberNavController() // 创建一个 NavController 实例
                 val items = listOf(Screen.Task, Screen.Downloads) // 定义底部导航栏的项目
 
-                Scaffold( // 使用 Scaffold 来提供底部导航栏的布局
+                Scaffold(
                     bottomBar = {
-                        NavigationBar { // 底部导航栏
+                        NavigationBar {
                             val navBackStackEntry by navController.currentBackStackEntryAsState()
                             val currentDestination = navBackStackEntry?.destination
 
-                            items.forEach { screen -> // 遍历每个导航项
+                            items.forEach { screen ->
                                 NavigationBarItem(
                                     icon = { Icon(screen.icon, contentDescription = null) },
                                     label = { Text(screen.label) },
-                                    selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true, // 判断当前项是否被选中
+                                    selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
                                     onClick = {
+                                        // 🚀 【关键修改】禁用状态恢复，确保视频页面被销毁
                                         navController.navigate(screen.route) {
-                                            // 弹出到导航图的起始目的地，避免在返回栈中积累大量目的地
+                                            // 弹出到导航图的起始目的地
                                             popUpTo(navController.graph.findStartDestination().id) {
-                                                saveState = true // 保存状态
+                                                saveState = false // 不保存状态
                                             }
                                             // 避免在重新选择同一项时创建同一目的地的多个副本
                                             launchSingleTop = true
-                                            // 重新选择之前选定的项目时恢复状态
-                                            restoreState = true
+                                            // 禁用状态恢复
+                                            restoreState = false
                                         }
                                     }
                                 )
                             }
                         }
                     }
-                ) { innerPadding -> // Scaffold 会提供一个内边距，以避免内容被底部栏遮挡
-                    // 将 innerPadding 传递给 AppNavHost，确保内容正确显示
+                ) { innerPadding ->
                     AppNavHost(navController = navController, modifier = Modifier.padding(innerPadding))
                 }
             }

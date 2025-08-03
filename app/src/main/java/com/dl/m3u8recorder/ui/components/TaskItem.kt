@@ -26,14 +26,11 @@ fun TaskItem(
     task: DownloadTask,
     onCancel: (String) -> Unit,
     onRetry: (String) -> Unit,
-    onPause: (String) -> Unit,
-    onResume: (String) -> Unit,
     onDeleteConfirmed: (String) -> Unit,
     onStopRecording: (String) -> Unit
 ) {
     val currentProgress by task._progress
     val currentStatusMessage by task._statusMessage
-    val currentIsPaused by task._isPaused
     val currentIsCancelled by task._isCancelled
     val downloadedSize by task._downloadedSize
     val elapsedTime by task._elapsedTime
@@ -69,7 +66,6 @@ fun TaskItem(
             )
             Spacer(modifier = Modifier.height(4.dp))
 
-            // 进度条和已下载大小放在同一行
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -78,19 +74,22 @@ fun TaskItem(
                 val progressValue = when {
                     currentProgress == 100 -> 1f
                     currentIsCancelled -> 1f
-                    currentIsPaused -> 1f
                     else -> currentProgress / 100f
                 }
 
-                if (currentProgress < 100 && !currentIsPaused && !currentIsCancelled && currentStatusMessage == "下载中") {
+                if (currentProgress < 100 && !currentIsCancelled && currentStatusMessage.contains("中")) {
                     LinearProgressIndicator(
-                        modifier = Modifier.weight(1f).height(3.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(3.dp),
                         color = MaterialTheme.colorScheme.primary
                     )
                 } else {
                     LinearProgressIndicator(
                         progress = { progressValue },
-                        modifier = Modifier.weight(1f).height(3.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(3.dp),
                         color = if (currentIsCancelled) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary,
                         trackColor = MaterialTheme.colorScheme.surfaceVariant
                     )
@@ -113,7 +112,6 @@ fun TaskItem(
                 Divider()
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // 第一行：状态、合并方式、是否直播
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -123,7 +121,6 @@ fun TaskItem(
                         text = "状态: ${currentStatusMessage.takeIf { it.isNotBlank() && it != "准备中" }
                             ?: when {
                                 currentIsCancelled -> "已取消"
-                                currentIsPaused -> "已暂停"
                                 currentProgress == 100 -> "下载完成"
                                 currentProgress in 1..99 -> "下载中"
                                 else -> "准备中"
@@ -146,7 +143,6 @@ fun TaskItem(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                // 第二行：已用时间、已下载大小
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -166,7 +162,7 @@ fun TaskItem(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // 第三行：所有按钮
+                // --- 第三行：所有按钮（核心修改） ---
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -176,50 +172,36 @@ fun TaskItem(
                     val buttonContentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                     val buttonTextSize = 12.sp
 
-                    if (currentIsCancelled) {
-                        Button(
-                            onClick = { onRetry(task.id) },
-                            modifier = buttonModifier,
-                            contentPadding = buttonContentPadding
-                        ) { Text("重试", fontSize = buttonTextSize) }
-                    } else if (currentIsPaused) {
-                        Button(
-                            onClick = { onResume(task.id) },
-                            modifier = buttonModifier,
-                            contentPadding = buttonContentPadding
-                        ) { Text("恢复", fontSize = buttonTextSize) }
-                    } else if (currentProgress < 100 && currentStatusMessage == "下载中") {
-                        Button(
-                            onClick = { onPause(task.id) },
-                            modifier = buttonModifier,
-                            contentPadding = buttonContentPadding
-                        ) { Text("暂停", fontSize = buttonTextSize) }
+                    // 如果任务正在进行中
+                    if (!currentIsCancelled && currentProgress < 100) {
                         if (task.isLive) {
-                            OutlinedButton(
+                            Button(
                                 onClick = { onStopRecording(task.id) },
                                 modifier = buttonModifier,
                                 contentPadding = buttonContentPadding
                             ) { Text("停止录制", fontSize = buttonTextSize) }
                         }
-                    } else if (currentProgress == 100) {
-                        Box(
-                            modifier = Modifier.fillMaxWidth(),
-                            contentAlignment = Alignment.CenterStart
-                        ) {
-                            Text(
-                                text = "任务完成",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.tertiary
-                            )
-                        }
-                    }
 
-                    val deleteButtonText = if (currentProgress < 100 && !currentIsCancelled) "取消/删除" else "删除"
-                    OutlinedButton(
-                        onClick = { showDeleteDialog = true },
-                        modifier = buttonModifier,
-                        contentPadding = buttonContentPadding
-                    ) { Text(deleteButtonText, fontSize = buttonTextSize) }
+                        OutlinedButton(
+                            onClick = { onCancel(task.id) },
+                            modifier = buttonModifier,
+                            contentPadding = buttonContentPadding
+                        ) { Text("取消/删除", fontSize = buttonTextSize) }
+
+                    } else if (currentIsCancelled || currentProgress == 100) {
+                        // 如果任务已取消或已完成
+                        Button(
+                            onClick = { onRetry(task.id) },
+                            modifier = buttonModifier,
+                            contentPadding = buttonContentPadding
+                        ) { Text("重试", fontSize = buttonTextSize) }
+
+                        OutlinedButton(
+                            onClick = { showDeleteDialog = true },
+                            modifier = buttonModifier,
+                            contentPadding = buttonContentPadding
+                        ) { Text("删除", fontSize = buttonTextSize) }
+                    }
                 }
             }
         }
