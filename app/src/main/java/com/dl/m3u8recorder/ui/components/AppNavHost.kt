@@ -1,5 +1,10 @@
 package com.dl.m3u8recorder.ui.components
 
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavHostController
@@ -21,7 +26,12 @@ fun AppNavHost(navController: NavHostController, modifier: Modifier = Modifier) 
     NavHost(
         navController = navController,
         startDestination = Routes.TASK_SCREEN,
-        modifier = modifier
+        modifier = modifier,
+        // 🚀 【关键修改】禁用或自定义动画过渡
+        enterTransition = { fadeIn(animationSpec = tween(0)) },
+        exitTransition = { fadeOut(animationSpec = tween(0)) },
+        popEnterTransition = { fadeIn(animationSpec = tween(0)) },
+        popExitTransition = { fadeOut(animationSpec = tween(0)) }
     ) {
         composable(Routes.TASK_SCREEN) {
             TaskScreen()
@@ -41,7 +51,6 @@ fun AppNavHost(navController: NavHostController, modifier: Modifier = Modifier) 
             val videoUriString = backStackEntry.arguments?.getString("videoUri")
             val videoUri = videoUriString?.let { Uri.decode(it).toUri() }
             if (videoUri != null) {
-                // 🚀 【关键】正确地将 navController 作为参数传递给 VideoPlayerScreen
                 VideoPlayerScreen(videoUri = videoUri, navController = navController)
             } else {
                 navController.popBackStack()
