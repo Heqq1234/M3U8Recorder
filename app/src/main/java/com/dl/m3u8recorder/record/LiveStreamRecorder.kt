@@ -163,8 +163,19 @@ class LiveStreamRecorder(private val context: Context) {
             task._downloadedSize.value = outputMp4File.length()
             task._elapsedTime.value = conversionSession.duration
             Log.d(TAG, "TS 到 MP4 转换成功: ${outputMp4File.absolutePath}")
+            // 删除临时 TS 文件
             inputTsFile.delete()
-            MediaStoreSaver.saveToMediaStore(context, outputMp4File, task.fileName, task.customDownloadUri)
+            // 将临时 MP4 文件保存到用户指定目录
+            val savedUri = MediaStoreSaver.saveToMediaStore(context, outputMp4File, task.fileName, task.customDownloadUri)
+
+            // 如果文件成功保存到指定目录，则删除临时 MP4 文件
+            if (savedUri != null) {
+                outputMp4File.delete()
+                Log.d(TAG, "已删除临时 MP4 文件: ${outputMp4File.absolutePath}")
+            } else {
+                // 如果保存失败，可能需要处理错误，但临时文件暂时保留以便调试
+                Log.e(TAG, "文件保存到指定目录失败，临时 MP4 文件未删除。")
+            }
         } else {
             val failLog = conversionSession.logsAsString
             task.statusMessage = "转换失败: ${conversionSession.returnCode}"
