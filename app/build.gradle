@@ -51,10 +51,20 @@ dependencies {
     implementation 'androidx.compose.material3:material3:1.2.1'
     implementation 'androidx.compose.ui:ui:1.6.7'
     implementation 'androidx.compose.ui:ui-tooling-preview:1.6.7'
+    implementation 'androidx.navigation:navigation-runtime-android:2.9.2'
+    implementation 'androidx.navigation:navigation-compose-android:2.9.2'
+
+    // 🚀 【重要修改】只保留 Media3 (新的 ExoPlayer) 依赖
+    implementation 'androidx.media3:media3-exoplayer:1.7.1'
+    implementation 'androidx.media3:media3-ui:1.7.1'
+
+
+
     debugImplementation 'androidx.compose.ui:ui-tooling:1.6.7'
 
     // ✅ 协程
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation "com.google.accompanist:accompanist-flowlayout:0.34.0" // 请检查最新版本
 
     // ✅ XML 样式资源支持（Material Components 2）
     implementation 'com.google.android.material:material:1.12.0'
