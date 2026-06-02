@@ -1,6 +1,0 @@
-R_DEF: Internal format may change without notice
-local
-color purple_500
-color purple_700
-color teal_200
-style Theme.M3U8Recorder

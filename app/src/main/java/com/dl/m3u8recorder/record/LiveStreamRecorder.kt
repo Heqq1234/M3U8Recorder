@@ -8,6 +8,7 @@ import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.Session
 import com.arthenica.ffmpegkit.Statistics
 import com.arthenica.ffmpegkit.ReturnCode
+import com.dl.m3u8recorder.llhls.LLHlsRecorder
 import com.dl.m3u8recorder.manager.DownloadManager
 import com.dl.m3u8recorder.model.DownloadTask
 import com.dl.m3u8recorder.utils.MediaStoreSaver
@@ -25,16 +26,69 @@ class LiveStreamRecorder(private val context: Context) {
     private val TAG = "LiveStreamRecorder"
     private val activeLiveSessions = mutableMapOf<String, FFmpegSession>()
 
+    // Phase 4: LL-HLS 录制器 - 使用 DownloadManager 中配置好的 OkHttpClient
+    private val llhlsRecorder by lazy { LLHlsRecorder(context, DownloadManager.getOkHttpClient()) }
+    private val activeLLHlsSessions = mutableSetOf<String>()
+
     /**
-     * 开始录制直播任务，直接写入到 TS 文件，支持追加。
-     * @param task 要录制的 DownloadTask 对象。
+     * 开始录制直播任务
+     * Phase 4: 根据是否为 LL-HLS 选择不同的录制方式
      */
     fun startRecording(task: DownloadTask) {
-        if (activeLiveSessions.containsKey(task.id)) {
+        if (activeLiveSessions.containsKey(task.id) || activeLLHlsSessions.contains(task.id)) {
             Log.w(TAG, "任务 ${task.id} 已在录制中。")
             return
         }
 
+        // Phase 4: 检测是否为 LL-HLS 直播
+        if (task.isLLHls) {
+            startLLHlsRecording(task)
+        } else {
+            startTraditionalRecording(task)
+        }
+    }
+
+    /**
+     * 开始 LL-HLS 录制
+     */
+    private fun startLLHlsRecording(task: DownloadTask) {
+        activeLLHlsSessions.add(task.id)
+        task.isCancelled = false
+        task.isPaused = false
+        task.statusMessage = "开始 LL-HLS 录制..."
+        DownloadManager.notifyTaskUpdated(task)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val outputFile = task.customDownloadUri?.let { uriString ->
+                    Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), task.fileName, ".mp4")
+                } ?: Mp4OutputHelper.getOutputFile(context, task.fileName, ".mp4")
+
+                llhlsRecorder.startRecording(task) { progress, status ->
+                    task.progress = progress.coerceIn(0, 100)
+                    task.statusMessage = status
+                    DownloadManager.notifyTaskUpdated(task)
+                }
+
+                // 录制完成
+                if (!task.isCancelled) {
+                    task.statusMessage = "录制完成"
+                    task.progress = 100
+                    MediaStoreSaver.saveToMediaStore(context, outputFile, task.fileName)
+                }
+            } catch (e: Exception) {
+                task.statusMessage = "录制错误: ${e.message}"
+            } finally {
+                activeLLHlsSessions.remove(task.id)
+                DownloadManager.notifyTaskUpdated(task)
+            }
+        }
+    }
+
+    /**
+     * 开始传统直播录制（FFmpeg 方式）
+     */
+    private fun startTraditionalRecording(task: DownloadTask) {
         task.isCancelled = false
         task.isPaused = false
         task.statusMessage = "开始录制直播流..."
@@ -47,16 +101,20 @@ class LiveStreamRecorder(private val context: Context) {
 
         // 确保父目录存在
         outputTsFile.parentFile?.mkdirs()
-
-        // FFmpeg 命令：直接录制到 TS 文件。
+        // Phase 1: 添加时间戳修正参数解决音画不同步和卡顿问题
         val command = listOf(
             "-i", task.url,
-            "-c", "copy",
+            "-fflags", "+genpts+igndts",
+            "-avoid_negative_ts", "make_zero",
+            "-max_interleave_delta", "0",
+            "-c:v", "copy",
+            "-c:a", "copy",
             "-f", "mpegts",
             "-flags", "+global_header",
             "-map", "0",
             "-max_muxing_queue_size", "1024",
-            outputTsFile.absolutePath // 输出文件路径
+            "-flush_packets", "1",
+            outputTsFile.absolutePath
         ).joinToString(" ")
 
         Log.d(TAG, "开始录制命令: $command")
@@ -146,9 +204,13 @@ class LiveStreamRecorder(private val context: Context) {
             Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), outputMp4FileName, "")
         } ?: Mp4OutputHelper.getOutputFile(context, outputMp4FileName, "")
 
+        // Phase 1: TS 到 MP4 转换也需要时间戳修正
         val convertCommand = listOf(
             "-i", inputTsFile.absolutePath,
-            "-c", "copy",
+            "-fflags", "+genpts",
+            "-avoid_negative_ts", "make_zero",
+            "-c:v", "copy",
+            "-c:a", "copy",
             "-movflags", "+faststart",
             outputMp4File.absolutePath
         ).joinToString(" ")
@@ -185,20 +247,68 @@ class LiveStreamRecorder(private val context: Context) {
     }
 
     /**
-     * 暂停录制。仅停止 FFmpeg 进程，保留已录制的 TS 文件。
+     * 暂停录制。
+     * - LL-HLS: 合并导出当前内容，生成可播放的 MP4
+     * - 传统 FFmpeg: 停止进程，保留 TS 文件
      * @param taskId 要暂停的任务 ID。
      */
     fun pauseRecording(taskId: String) {
+        // 检查是否是 LL-HLS 会话
+        if (activeLLHlsSessions.contains(taskId)) {
+            CoroutineScope(Dispatchers.IO).launch {
+                val task = DownloadManager.getTasks().find { it.id == taskId }
+                if (task != null) {
+                    // 生成带时间戳的输出文件名
+                    val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                    val outputFileName = "${task.fileName}_paused_$timestamp"
+
+                    val outputFile = task.customDownloadUri?.let { uriString ->
+                        Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), outputFileName, ".mp4")
+                    } ?: Mp4OutputHelper.getOutputFile(context, outputFileName, ".mp4")
+
+                    // 合并导出
+                    llhlsRecorder.stopRecording(taskId, outputFile)
+                    activeLLHlsSessions.remove(taskId)
+
+                    // 保存到媒体库
+                    MediaStoreSaver.saveToMediaStore(context, outputFile, outputFileName)
+
+                    task.statusMessage = "已暂停（已保存: ${outputFile.name}）"
+                    task.isPaused = true
+                    DownloadManager.notifyTaskUpdated(task)
+                }
+            }
+            Log.d(TAG, "暂停 LL-HLS 录制并导出: $taskId")
+            return
+        }
+
+        // 传统 FFmpeg 录制暂停
         val session = activeLiveSessions[taskId]
         session?.cancel()
         Log.d(TAG, "发送取消信号给录制会话 (暂停): $taskId")
     }
 
     /**
-     * 恢复录制。重新启动 FFmpeg 进程，继续向现有 TS 文件追加。
+     * 恢复录制。
+     * - LL-HLS: 作为新任务重新开始（因为直播内容已过去）
+     * - 传统 FFmpeg: 继续向现有 TS 文件追加
      * @param task 要恢复的 DownloadTask 对象。
      */
     fun resumeRecording(task: DownloadTask) {
+        // LL-HLS 恢复：重新开始
+        if (task.isLLHls) {
+            if (!activeLLHlsSessions.contains(task.id)) {
+                Log.d(TAG, "恢复 LL-HLS 录制 (重新开始): ${task.id}")
+                task.isPaused = false
+                task.isCancelled = false
+                startLLHlsRecording(task)
+            } else {
+                Log.w(TAG, "LL-HLS 任务 ${task.id} 已经在运行，无法恢复。")
+            }
+            return
+        }
+
+        // 传统 FFmpeg 恢复
         if (!activeLiveSessions.containsKey(task.id)) {
             Log.d(TAG, "恢复录制: ${task.id}")
             startRecording(task)
@@ -208,11 +318,36 @@ class LiveStreamRecorder(private val context: Context) {
     }
 
     /**
-     * 停止录制 (由用户明确触发，例如点击“停止”按钮)。
-     * 停止 FFmpeg 进程并触发最终的 TS 到 MP4 转换。
+     * 停止录制 (由用户明确触发，例如点击”停止”按钮)。
+     * 停止 FFmpeg 进程或 LL-HLS 录制器。
      * @param taskId 要停止的任务 ID。
      */
     fun stopRecording(taskId: String) {
+        // 检查是否是 LL-HLS 会话
+        if (activeLLHlsSessions.contains(taskId)) {
+            CoroutineScope(Dispatchers.IO).launch {
+                val task = DownloadManager.getTasks().find { it.id == taskId }
+                if (task != null) {
+                    val outputFile = task.customDownloadUri?.let { uriString ->
+                        Mp4OutputHelper.getOutputFileFromUri(context, Uri.parse(uriString), task.fileName, ".mp4")
+                    } ?: Mp4OutputHelper.getOutputFile(context, task.fileName, ".mp4")
+
+                    llhlsRecorder.stopRecording(taskId, outputFile)
+                    activeLLHlsSessions.remove(taskId)
+
+                    // 保存到媒体库
+                    MediaStoreSaver.saveToMediaStore(context, outputFile, task.fileName, task.customDownloadUri)
+
+                    task.statusMessage = "录制完成"
+                    task.progress = 100
+                    DownloadManager.notifyTaskUpdated(task)
+                }
+            }
+            Log.d(TAG, "停止 LL-HLS 录制: $taskId");
+            return
+        }
+
+        // 传统 FFmpeg 录制停止
         val session = activeLiveSessions[taskId]
         session?.cancel()
         activeLiveSessions.remove(taskId)

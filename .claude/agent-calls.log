@@ -1,0 +1,10 @@
+{"timestamp":"2026-05-27T08:59:34.493Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
+{"timestamp":"2026-05-27T08:59:34.495Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
+{"timestamp":"2026-05-27T08:59:34.498Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
+{"timestamp":"2026-05-27T09:02:20.270Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}
+{"timestamp":"2026-05-27T09:02:27.680Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}
+{"timestamp":"2026-05-27T09:02:45.041Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}
+{"timestamp":"2026-05-27T09:03:09.516Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
+{"timestamp":"2026-05-27T09:13:19.710Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}
+{"timestamp":"2026-06-02T00:52:14.615Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
+{"timestamp":"2026-06-02T00:53:51.249Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}

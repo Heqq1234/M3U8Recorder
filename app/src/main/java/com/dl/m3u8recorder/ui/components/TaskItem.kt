@@ -160,6 +160,74 @@ fun TaskItem(
                     )
                 }
 
+                // Phase 3: 显示已选择的分辨率
+                if (task.selectedResolution != null || task.selectedVariantLabel != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        task.selectedVariantLabel?.let { label ->
+                            Text(
+                                text = "分辨率: $label",
+                                fontSize = 11.sp,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } ?: task.selectedResolution?.let { res ->
+                            Text(
+                                text = "分辨率: $res",
+                                fontSize = 11.sp,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        if (task.selectedBandwidth > 0) {
+                            Text(
+                                text = "码率: ${formatBandwidth(task.selectedBandwidth)}",
+                                fontSize = 11.sp,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
+                }
+
+                // Phase 4: LL-HLS 双轨进度显示
+                if (task.isLLHls) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    val videoProgress by task._videoProgress
+                    val audioProgress by task._audioProgress
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "视频: $videoProgress%",
+                                fontSize = 10.sp,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                            LinearProgressIndicator(
+                                progress = { videoProgress / 100f },
+                                modifier = Modifier.fillMaxWidth().height(2.dp)
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "音频: $audioProgress%",
+                                fontSize = 10.sp,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                            LinearProgressIndicator(
+                                progress = { audioProgress / 100f },
+                                modifier = Modifier.fillMaxWidth().height(2.dp)
+                            )
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(8.dp))
 
                 // --- 第三行：所有按钮（核心修改） ---
@@ -246,4 +314,12 @@ fun formatElapsedTime(milliseconds: Long): String {
     val minutes = TimeUnit.MILLISECONDS.toMinutes(milliseconds) % 60
     val seconds = TimeUnit.MILLISECONDS.toSeconds(milliseconds) % 60
     return String.format("%02d:%02d:%02d", hours, minutes, seconds)
+}
+
+fun formatBandwidth(bandwidth: Long): String {
+    return when {
+        bandwidth >= 1_000_000 -> "%.1f Mbps".format(bandwidth / 1_000_000.0)
+        bandwidth >= 1_000 -> "%.0f Kbps".format(bandwidth / 1_000.0)
+        else -> "$bandwidth bps"
+    }
 }

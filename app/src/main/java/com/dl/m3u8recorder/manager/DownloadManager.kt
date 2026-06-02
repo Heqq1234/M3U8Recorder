@@ -5,13 +5,20 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import com.dl.m3u8recorder.downloader.M3U8Downloader
+import com.dl.m3u8recorder.llhls.LLHlsRecorder
 import com.dl.m3u8recorder.merger.FFmpegStreamMerger
 import com.dl.m3u8recorder.model.DownloadTask
+import com.dl.m3u8recorder.parser.M3U8ParserImpl
+import com.dl.m3u8recorder.parser.M3U8Playlist
+import com.dl.m3u8recorder.parser.ResolvedStream
+import com.dl.m3u8recorder.parser.VariantStream
 import com.dl.m3u8recorder.record.LiveStreamRecorder
 import com.dl.m3u8recorder.service.LiveRecordingService
 import com.dl.m3u8recorder.utils.MediaStoreSaver
 import com.dl.m3u8recorder.utils.Mp4OutputHelper
 import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -24,10 +31,36 @@ object DownloadManager {
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val downloader = M3U8Downloader() // 用于非直播任务的下载器
 
+    // Phase 2: M3U8 解析器
+    private val m3u8Parser = M3U8ParserImpl()
+
+    // 简洁的请求头，避免被检测
+    private val okHttpClient = OkHttpClient.Builder()
+        .retryOnConnectionFailure(true)
+        .addInterceptor { chain ->
+            val originalRequest = chain.request()
+            val url = originalRequest.url.toString()
+
+            val builder = originalRequest.newBuilder()
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept", "*/*")
+
+            // Chaturbate 流媒体需要 Referer
+            if (url.contains("highwebmedia.com") || url.contains("chaturbate")) {
+                builder.header("Referer", "https://chaturbate.com/")
+            }
+
+            chain.proceed(builder.build())
+        }
+        .build()
+
     @SuppressLint("StaticFieldLeak") // 针对 appContext 和 liveStreamRecorder 的静态引用警告
     private lateinit var appContext: Context
     @SuppressLint("StaticFieldLeak")
     lateinit var liveStreamRecorder: LiveStreamRecorder // 用于直播任务的录制器
+
+    // Phase 4: LL-HLS 录制器
+    private var llhlsRecorder: LLHlsRecorder? = null
 
     // 监听器列表，使用 CopyOnWriteArrayList 保证在迭代时修改的线程安全
     private val listeners = CopyOnWriteArrayList<TaskListener>()
@@ -37,6 +70,10 @@ object DownloadManager {
         appContext = context.applicationContext
         if (!::liveStreamRecorder.isInitialized) {
             liveStreamRecorder = LiveStreamRecorder(appContext)
+        }
+        // Phase 4: 初始化 LL-HLS 录制器
+        if (llhlsRecorder == null) {
+            llhlsRecorder = LLHlsRecorder(appContext, okHttpClient)
         }
         Log.d(TAG, "DownloadManager initialized.")
     }
@@ -92,32 +129,362 @@ object DownloadManager {
     }
 
     /**
-     * 添加新的下载任务。
+     * 添加新的下载任务（异步解析并自动选择最高画质）。
      * @param url M3U8链接。
      * @param fileName 文件名。
      * @param realtimeMerge 是否边下载边合并。
      * @param isLive 是否为直播流。
      * @param downloadDirectoryUri 自定义下载目录的 URI。
+     * @param preferredResolution 首选分辨率高度（null = 自动选择最高）。
      */
-    fun addTask(url: String, fileName: String, realtimeMerge: Boolean = true, isLive: Boolean = false,
-                downloadDirectoryUri: Uri?) {
+    fun addTask(
+        url: String,
+        fileName: String,
+        realtimeMerge: Boolean = true,
+        isLive: Boolean = false,
+        downloadDirectoryUri: Uri?,
+        preferredResolution: Int? = null
+    ) {
+        // 异步解析 M3U8 并添加任务
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val resolved = analyzeAndResolveUrl(url, preferredResolution)
+
+                withContext(Dispatchers.Main) {
+                    // 对于直播流，如果检测到 LL-HLS 或者无法确定，默认使用 LL-HLS 录制器
+                    val shouldUseLLHls = isLive && (resolved.isLLHls || resolved.videoPlaylistUrl?.contains("llhls") == true)
+
+                    val task = DownloadTask(
+                        id = "task_${System.currentTimeMillis()}",
+                        url = url,
+                        fileName = fileName,
+                        realtimeMerge = realtimeMerge,
+                        isLive = isLive,
+                        customDownloadUri = downloadDirectoryUri?.toString(),
+                        // Phase 2: Master Playlist 支持
+                        isMasterPlaylist = resolved.isMasterPlaylist,
+                        selectedVariantUrl = resolved.videoPlaylistUrl,
+                        selectedResolution = resolved.selectedVariant?.resolution?.toString(),
+                        selectedBandwidth = resolved.selectedVariant?.bandwidth ?: 0L,
+                        audioTrackUrl = resolved.audioPlaylistUrl,
+                        selectedVariantLabel = resolved.selectedVariant?.resolution?.getShortLabel(),
+                        // Phase 4: LL-HLS 支持
+                        isLLHls = shouldUseLLHls
+                    )
+
+                    Log.d(TAG, "addTask: ${task.id} (isLive: $isLive, isMaster: ${resolved.isMasterPlaylist}, isLLHls: $shouldUseLLHls, resolution: ${task.selectedResolution}, videoUrl: ${resolved.videoPlaylistUrl})")
+
+                    currentTasksState[task.id] = task
+                    notifyQueueChanged()
+
+                    if (isLive) {
+                        LiveRecordingService.startService(appContext, task)
+                    } else {
+                        startDownloadJob(task)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "解析 M3U8 失败: $url", e)
+                // 即使解析失败，也创建基本任务（向后兼容）
+                withContext(Dispatchers.Main) {
+                    val task = DownloadTask(
+                        id = "task_${System.currentTimeMillis()}",
+                        url = url,
+                        fileName = fileName,
+                        realtimeMerge = realtimeMerge,
+                        isLive = isLive,
+                        customDownloadUri = downloadDirectoryUri?.toString(),
+                        // 对于直播流，默认尝试 LL-HLS
+                        isLLHls = isLive
+                    )
+                    currentTasksState[task.id] = task
+                    notifyQueueChanged()
+
+                    if (isLive) {
+                        LiveRecordingService.startService(appContext, task)
+                    } else {
+                        startDownloadJob(task)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 添加任务并指定变体（用于 UI 选择分辨率后）
+     */
+    fun addTaskWithVariant(
+        url: String,
+        fileName: String,
+        variant: VariantStream,
+        audioUrl: String?,
+        realtimeMerge: Boolean = true,
+        isLive: Boolean = false,
+        downloadDirectoryUri: Uri?
+    ) {
         val task = DownloadTask(
             id = "task_${System.currentTimeMillis()}",
             url = url,
             fileName = fileName,
             realtimeMerge = realtimeMerge,
             isLive = isLive,
-            customDownloadUri = downloadDirectoryUri?.toString() // 将 URI 转换为字符串保存
+            customDownloadUri = downloadDirectoryUri?.toString(),
+            isMasterPlaylist = true,
+            selectedVariantUrl = variant.uri,
+            selectedResolution = variant.resolution?.toString(),
+            selectedBandwidth = variant.bandwidth,
+            audioTrackUrl = audioUrl,
+            selectedVariantLabel = variant.resolution?.getShortLabel() ?: "${variant.bandwidth / 1000}kbps"
         )
+
         currentTasksState[task.id] = task
-        notifyQueueChanged() // 通知 UI 队列有新任务
+        notifyQueueChanged()
 
         if (isLive) {
-            LiveRecordingService.startService(appContext, task) // 启动直播录制服务
+            LiveRecordingService.startService(appContext, task)
         } else {
-            startDownloadJob(task) // 启动非直播下载任务
+            startDownloadJob(task)
         }
-        Log.d(TAG, "addTask: ${task.id} (isLive: $isLive) to ${task.customDownloadUri ?: "default"}")
+
+        Log.d(TAG, "addTaskWithVariant: ${task.id} resolution=${task.selectedResolution}")
+    }
+
+    /**
+     * 判断输入是 URL 还是 M3U8 内容
+     */
+    fun isM3U8Content(input: String): Boolean {
+        val trimmed = input.trim()
+        // 检查是否以 M3U8 标签开始，或包含 Master Playlist 标签
+        return trimmed.startsWith("#EXTM3U") ||
+               trimmed.contains("#EXT-X-STREAM-INF") ||
+               trimmed.contains("#EXT-X-TARGETDURATION")
+    }
+
+    /**
+     * 从可能包含 curl 输出的内容中提取纯净的 M3U8 内容
+     */
+    private fun extractM3U8Content(input: String): String {
+        val lines = input.lines()
+        val m3u8StartIndex = lines.indexOfFirst { it.trim().startsWith("#EXTM3U") }
+
+        return if (m3u8StartIndex >= 0) {
+            // 从 #EXTM3U 开始提取
+            lines.drop(m3u8StartIndex).joinToString("\n")
+        } else {
+            input
+        }
+    }
+
+    /**
+     * 异步分析 URL 或 M3U8 内容，返回可用的分辨率列表（供 UI 展示）
+     * @param input URL 或 M3U8 内容
+     * @param baseUrl 如果输入是 M3U8 内容，需要提供基础 URL 用于解析相对路径
+     */
+    suspend fun analyzeUrl(input: String, baseUrl: String? = null): List<VariantStream> = withContext(Dispatchers.IO) {
+        try {
+            val (content, effectiveBaseUrl) = if (isM3U8Content(input)) {
+                // 输入是 M3U8 内容，提取纯净内容
+                val cleanContent = extractM3U8Content(input)
+                val base = baseUrl ?: extractBaseUrlFromContent(cleanContent)
+                Log.d(TAG, "M3U8内容模式: baseUrl=$base")
+                Pair(cleanContent, base)
+            } else {
+                // 输入是 URL
+                Log.d(TAG, "URL模式: $input")
+                Pair(fetchM3U8Content(input), input)
+            }
+
+            if (effectiveBaseUrl.isBlank()) {
+                Log.e(TAG, "基础 URL 为空，无法解析相对路径")
+                return@withContext emptyList<VariantStream>()
+            }
+
+            val playlist = m3u8Parser.parse(content, effectiveBaseUrl)
+
+            when (playlist) {
+                is M3U8Playlist.Master -> {
+                    Log.d(TAG, "Master Playlist: ${playlist.variants.size} 个变体, ${playlist.audioRenditions.size} 个音频轨")
+                    // 按带宽降序排列
+                    playlist.variants.sortedByDescending { it.bandwidth }
+                }
+                is M3U8Playlist.Media -> {
+                    Log.d(TAG, "Media Playlist: 非Master，单分辨率")
+                    // 单一分辨率，返回空列表表示无需选择
+                    emptyList()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "分析失败: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * 从 M3U8 内容中提取基础 URL（尝试从内容中提取）
+     */
+    private fun extractBaseUrlFromContent(content: String): String {
+        // 尝试从内容中找到任何 URL 来推断基础 URL
+        val lines = content.lines()
+        for (line in lines) {
+            val trimmedLine = line.trim()
+            // 检查是否是完整的 URL 行
+            if (trimmedLine.startsWith("http://") || trimmedLine.startsWith("https://")) {
+                try {
+                    val uri = java.net.URI(trimmedLine)
+                    val baseUrl = "${uri.scheme}://${uri.authority}"
+                    Log.d(TAG, "从内容推断基础 URL: $baseUrl")
+                    return baseUrl
+                } catch (e: Exception) {
+                    Log.w(TAG, "URL 解析失败: $trimmedLine")
+                }
+            }
+        }
+        Log.w(TAG, "无法从内容推断基础 URL，需要用户手动输入")
+        return ""
+    }
+
+    /**
+     * 从 M3U8 内容中提取最佳流的完整 URL
+     * @param content M3U8 内容
+     * @param baseUrl 基础 URL（curl 命令中的 URL）
+     * @return 最佳流的完整 URL，如果解析失败返回 null
+     */
+    fun extractBestStreamUrl(content: String, baseUrl: String): String? {
+        return try {
+            val cleanContent = extractM3U8Content(content)
+            val playlist = m3u8Parser.parse(cleanContent, baseUrl)
+
+            when (playlist) {
+                is M3U8Playlist.Master -> {
+                    val bestVariant = m3u8Parser.selectBestVariant(playlist.variants)
+                    Log.d(TAG, "最佳流: ${bestVariant.resolution}, ${bestVariant.getBandwidthLabel()}, URL: ${bestVariant.uri}")
+                    bestVariant.uri
+                }
+                is M3U8Playlist.Media -> {
+                    // 已经是 Media Playlist，直接返回基础 URL
+                    baseUrl
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "提取最佳流 URL 失败", e)
+            null
+        }
+    }
+
+    /**
+     * 从 Master Playlist 内容中解析音频轨 URL
+     */
+    fun getAudioUrlFromContent(content: String, baseUrl: String, audioGroupId: String?): String? {
+        if (audioGroupId == null) {
+            Log.d(TAG, "无音频组ID，跳过音频轨获取")
+            return null
+        }
+
+        return try {
+            val cleanContent = extractM3U8Content(content)
+            val playlist = m3u8Parser.parse(cleanContent, baseUrl)
+            if (playlist is M3U8Playlist.Master) {
+                val audioUrl = playlist.audioRenditions.find { it.groupId == audioGroupId && it.uri != null }?.uri
+                Log.d(TAG, "音频轨 URL: $audioUrl (groupId: $audioGroupId)")
+                audioUrl
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "获取音频轨 URL 失败", e)
+            null
+        }
+    }
+
+    /**
+     * 从 Master Play url 获取音频轨 URL (异步版本)
+     */
+    suspend fun getAudioRenditions(url: String, audioGroupId: String?): String? = withContext(Dispatchers.IO) {
+        if (audioGroupId == null) return@withContext null
+
+        try {
+            val content = fetchM3U8Content(url)
+            val playlist = m3u8Parser.parse(content, url)
+
+            if (playlist is M3U8Playlist.Master) {
+                playlist.audioRenditions.find { it.groupId == audioGroupId && it.uri != null }?.uri
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "获取音频轨失败", e)
+            null
+        }
+    }
+
+    /**
+     * 内部方法：分析并解析 URL
+     */
+    private suspend fun analyzeAndResolveUrl(url: String, preferredResolution: Int?): ResolvedStream = withContext(Dispatchers.IO) {
+        Log.d(TAG, "analyzeAndResolveUrl: 开始解析 $url")
+        val content = fetchM3U8Content(url)
+        Log.d(TAG, "analyzeAndResolveUrl: 获取到内容长度 ${content.length}")
+
+        val playlist = m3u8Parser.parse(content, url)
+
+        when (playlist) {
+            is M3U8Playlist.Master -> {
+                Log.d(TAG, "analyzeAndResolveUrl: Master Playlist, ${playlist.variants.size} 个变体")
+                val resolved = m3u8Parser.resolveMasterPlaylist(playlist, preferredResolution)
+
+                Log.d(TAG, "analyzeAndResolveUrl: 选择的视频URL: ${resolved.videoPlaylistUrl}")
+                Log.d(TAG, "analyzeAndResolveUrl: 选择的音频URL: ${resolved.audioPlaylistUrl}")
+
+                // 检测视频 playlist 是否为 LL-HLS
+                val isLLHls = resolved.videoPlaylistUrl?.let { videoUrl ->
+                    if (videoUrl.isBlank()) {
+                        Log.e(TAG, "analyzeAndResolveUrl: 视频URL为空!")
+                        false
+                    } else {
+                        try {
+                            val videoContent = fetchM3U8Content(videoUrl)
+                            val result = videoContent.contains("#EXT-X-PART") || videoContent.contains("#EXT-X-SERVER-CONTROL")
+                            Log.d(TAG, "analyzeAndResolveUrl: LL-HLS 检测结果: $result")
+                            result
+                        } catch (e: Exception) {
+                            Log.e(TAG, "analyzeAndResolveUrl: 获取视频playlist失败", e)
+                            false
+                        }
+                    }
+                } ?: false
+
+                resolved.copy(isLLHls = isLLHls)
+            }
+            is M3U8Playlist.Media -> {
+                Log.d(TAG, "analyzeAndResolveUrl: Media Playlist, isLLHls=${playlist.isLLHls}")
+                ResolvedStream(
+                    videoPlaylistUrl = url,
+                    audioPlaylistUrl = null,
+                    isMasterPlaylist = false,
+                    isLLHls = playlist.isLLHls,
+                    selectedVariant = null,
+                    availableVariants = emptyList()
+                )
+            }
+        }
+    }
+
+    /**
+     * 获取 M3U8 内容
+     */
+    private suspend fun fetchM3U8Content(url: String): String = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(url).build()
+        val response = okHttpClient.newCall(request).execute()
+
+        val body = response.body?.string() ?: throw Exception("响应体为空")
+
+        // 检查是否是有效的 M3U8 内容
+        if (!body.trim().startsWith("#EXTM3U")) {
+            Log.e(TAG, "返回内容不是有效的 M3U8, 前100字符: ${body.take(100)}")
+            throw Exception("返回内容不是有效的 M3U8 格式")
+        }
+
+        body
     }
 
     // 启动非直播下载任务的协程
@@ -140,18 +507,25 @@ object DownloadManager {
                 task._elapsedTime.value = 0L
                 notifyTaskUpdated(task)
 
-                // 根据合并方式选择下载流程
-                if (task.realtimeMerge) {
-                    val merger = FFmpegStreamMerger(outputFile)
-                    downloader.startDownloadWithRealtimeMerge(task, merger) { progress, statusMessage ->
-                        // FFmpegStreamMerger 会更新 task.progress, task.statusMessage 等
-                        // 这里只需要通知 DownloadManager 来广播更新
-                        notifyTaskUpdated(task) // task 对象在 FFmpegStreamMerger 内部已被更新
+                // Phase 4: 检测 LL-HLS
+                if (task.isLLHls && !task.isLive) {
+                    // LL-HLS 点播流
+                    llhlsRecorder?.startRecording(task) { progress, status ->
+                        task.progress = progress.coerceIn(0, 100)
+                        task.statusMessage = status
+                        notifyTaskUpdated(task)
                     }
                 } else {
-                    downloader.downloadAllTsThenMerge(task, outputFile) { progress, statusMessage ->
-                        // downloader.downloadAllTsThenMerge 会更新 task.progress, task.statusMessage 等
-                        notifyTaskUpdated(task) // task 对象在 downloader 内部已被更新
+                    // 传统 HLS 下载
+                    if (task.realtimeMerge) {
+                        val merger = FFmpegStreamMerger(outputFile)
+                        downloader.startDownloadWithRealtimeMerge(task, merger) { progress, statusMessage ->
+                            notifyTaskUpdated(task)
+                        }
+                    } else {
+                        downloader.downloadAllTsThenMerge(task, outputFile) { progress, statusMessage ->
+                            notifyTaskUpdated(task)
+                        }
                     }
                 }
 
@@ -335,4 +709,9 @@ object DownloadManager {
         fun onTaskUpdated(task: DownloadTask) // 当单个任务状态更新时
         fun onQueueChanged(tasks: List<DownloadTask>) // 当任务队列（增删）发生变化时
     }
+
+    /**
+     * 获取配置好的 OkHttpClient（包含请求头等）
+     */
+    fun getOkHttpClient(): OkHttpClient = okHttpClient
 }

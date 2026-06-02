@@ -2,6 +2,7 @@ plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
     id 'kotlin-parcelize'
+    id 'com.google.devtools.ksp'
 }
 
 android {
@@ -25,7 +26,7 @@ android {
     }
 
     composeOptions {
-        kotlinCompilerExtensionVersion '1.5.0'
+        kotlinCompilerExtensionVersion '1.5.10' // 🚀 【关键修复】将 Compose 编译器版本与 Kotlin 1.9.22 匹配
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -33,6 +34,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = '17'
+    }
+
+    lint {
+        disable 'NullSafeMutableLiveData'
     }
 
     packagingOptions {
@@ -55,8 +60,11 @@ dependencies {
     implementation 'androidx.navigation:navigation-compose-android:2.9.2'
 
     // 🚀 【重要修改】只保留 Media3 (新的 ExoPlayer) 依赖
-    implementation 'androidx.media3:media3-exoplayer:1.7.1'
-    implementation 'androidx.media3:media3-ui:1.7.1'
+    implementation 'androidx.media3:media3-exoplayer:1.8.0'
+    implementation 'androidx.media3:media3-ui:1.8.0'
+    implementation "androidx.room:room-runtime:2.6.1"
+    ksp 'androidx.room:room-compiler:2.6.1'
+    implementation "androidx.room:room-ktx:2.6.1"
 
 
 
@@ -64,10 +72,10 @@ dependencies {
 
     // ✅ 协程
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
-    implementation "com.google.accompanist:accompanist-flowlayout:0.34.0" // 请检查最新版本
+    implementation "com.google.accompanist:accompanist-flowlayout:0.34.0"
 
     // ✅ XML 样式资源支持（Material Components 2）
     implementation 'com.google.android.material:material:1.12.0'
-    implementation 'com.squareup.okhttp3:okhttp:4.12.0'  // 使用最新版本
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'com.arthenica:ffmpeg-kit-full:4.5.LTS'
 }

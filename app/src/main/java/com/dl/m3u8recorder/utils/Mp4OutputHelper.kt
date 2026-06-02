@@ -19,7 +19,8 @@ object Mp4OutputHelper {
      */
     fun getAppSpecificDownloadsDir(context: Context): File {
         val dir = ContextCompat.getExternalFilesDirs(context, Environment.DIRECTORY_MOVIES)?.firstOrNull()
-        return dir ?: context.filesDir // Fallback to internal files dir
+        return dir ?: context.filesDir // Fallback to internal files dirclaude
+
     }
 
     /**

@@ -45,7 +45,18 @@ class FFmpegStreamMerger(
                 }
             }
 
-            val command = "-f concat -safe 0 -i ${concatFile.absolutePath} -c copy ${outputFile.absolutePath}"
+            // Phase 1: 添加时间戳修正参数解决音画不同步问题
+            val command = listOf(
+                "-fflags", "+genpts+igndts",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concatFile.absolutePath,
+                "-avoid_negative_ts", "make_zero",
+                "-max_interleave_delta", "0",
+                "-c", "copy",
+                "-movflags", "+faststart",
+                outputFile.absolutePath
+            ).joinToString(" ")
             Log.d(TAG, "执行合并命令: $command")
 
             val session = FFmpegKit.execute(command)
