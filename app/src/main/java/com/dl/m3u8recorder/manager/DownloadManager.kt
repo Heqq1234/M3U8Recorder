@@ -18,9 +18,12 @@ import com.dl.m3u8recorder.utils.MediaStoreSaver
 import com.dl.m3u8recorder.utils.Mp4OutputHelper
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import okhttp3.ConnectionPool
 
 object DownloadManager {
     private const val TAG = "DownloadManager"
@@ -34,9 +37,14 @@ object DownloadManager {
     // Phase 2: M3U8 解析器
     private val m3u8Parser = M3U8ParserImpl()
 
-    // 简洁的请求头，避免被检测
+    // 优化的 OkHttpClient：大连接池 + HTTP/2 + 快速超时
     private val okHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
+        .connectionPool(ConnectionPool(64, 5, TimeUnit.MINUTES)) // 大连接池支持多任务并发
+        .connectTimeout(3, TimeUnit.SECONDS)  // 快速失败
+        .readTimeout(8, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.HTTP_1_1)) // HTTP/2 优先
         .addInterceptor { chain ->
             val originalRequest = chain.request()
             val url = originalRequest.url.toString()

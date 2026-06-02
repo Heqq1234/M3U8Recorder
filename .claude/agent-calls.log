@@ -8,3 +8,5 @@
 {"timestamp":"2026-05-27T09:13:19.710Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}
 {"timestamp":"2026-06-02T00:52:14.615Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
 {"timestamp":"2026-06-02T00:53:51.249Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}
+{"timestamp":"2026-06-02T07:47:59.192Z","event":"agent_call_start","type":"unknown","subagent_type":null,"prompt_preview":"none"}
+{"timestamp":"2026-06-02T07:50:50.126Z","event":"agent_call_end","type":"unknown","status":"completed","duration":"unknown"}

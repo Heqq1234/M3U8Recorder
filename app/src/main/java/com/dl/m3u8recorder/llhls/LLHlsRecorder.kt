@@ -293,7 +293,7 @@ class LLHlsRecorder(
     }
 
     /**
-     * 下载并追加部分片段
+     * 下载并追加部分片段（并行下载 + 有序写入 + 全局并发限制）
      */
     private suspend fun downloadAndAppendParts(
         parts: List<Part>,
@@ -304,15 +304,18 @@ class LLHlsRecorder(
     ) {
         if (appender == null || session.isStopped) return
 
-        for (part in parts) {
-            if (session.isStopped) break
+        // 过滤未下载的部分片段
+        val newParts = parts.filter { deduplicator.markPartDownloaded(it.uri) }
 
-            // 去重
-            if (!deduplicator.markPartDownloaded(part.uri)) {
-                continue
-            }
+        if (newParts.isEmpty()) return
 
-            val data = partDownloader.download(part.uri)
+        // 带序号的 URI 列表
+        val indexedUris = newParts.mapIndexed { index, part -> index to part.uri }
+
+        // 并行下载，按顺序写入
+        partDownloader.downloadParallelOrdered(indexedUris) { index, data ->
+            if (session.isStopped) return@downloadParallelOrdered
+
             if (data != null) {
                 appender.appendFragment(data)
 

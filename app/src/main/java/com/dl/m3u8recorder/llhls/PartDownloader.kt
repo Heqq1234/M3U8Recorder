@@ -2,10 +2,16 @@ package com.dl.m3u8recorder.llhls
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
+import java.util.TreeMap
 
 /**
  * Partial Segment 下载器
@@ -18,6 +24,10 @@ class PartDownloader(
     companion object {
         private const val TAG = "PartDownloader"
         private const val MAX_RETRIES = 3
+        private const val MAX_CONCURRENT_DOWNLOADS = 128  // 全局最大并发：支持多任务同时下载
+
+        // 全局信号量，限制所有任务的并发下载总数
+        private val globalSemaphore = Semaphore(MAX_CONCURRENT_DOWNLOADS)
     }
 
     /**
@@ -51,9 +61,9 @@ class PartDownloader(
                 Log.w(TAG, "Download exception attempt ${attempt + 1}: $uri", e)
             }
 
-            // 短暂延迟后重试
+            // 指数退避重试，但更快
             if (attempt < MAX_RETRIES - 1) {
-                Thread.sleep(500L * (attempt + 1))
+                Thread.sleep(100L * (attempt + 1)) // 100ms, 200ms, 300ms
             }
         }
 
@@ -103,5 +113,54 @@ class PartDownloader(
         } catch (e: Exception) {
             false
         }
+    }
+
+    /**
+     * 并行下载多个片段
+     * @param uris 片段 URI 列表
+     * @return 片段数据列表（与输入顺序对应，失败为 null）
+     */
+    suspend fun downloadParallel(uris: List<String>): List<ByteArray?> = coroutineScope {
+        uris.map { uri ->
+            async(Dispatchers.IO) { downloadWithLimit(uri) }
+        }.awaitAll()
+    }
+
+    /**
+     * 带并发限制的下载
+     */
+    private suspend fun downloadWithLimit(uri: String): ByteArray? =
+        globalSemaphore.withPermit { download(uri) }
+
+    /**
+     * 并行下载多个片段，并按顺序写入（用于需要保证顺序的场景）
+     * @param parts 部分片段列表（带序号）
+     * @param onWrite 写入回调，保证顺序
+     */
+    suspend fun downloadParallelOrdered(
+        parts: List<Pair<Int, String>>,
+        onWrite: suspend (index: Int, data: ByteArray?) -> Unit
+    ) = coroutineScope {
+        if (parts.isEmpty()) return@coroutineScope
+
+        // 有序缓冲区：序号 -> 数据
+        val buffer = TreeMap<Int, ByteArray?>()
+        var nextWriteIndex = 0
+
+        // 并行下载
+        parts.map { (index, uri) ->
+            async(Dispatchers.IO) {
+                val data = downloadWithLimit(uri)
+                synchronized(buffer) {
+                    buffer[index] = data
+                    // 尝试按顺序写入
+                    while (buffer.containsKey(nextWriteIndex)) {
+                        val toWrite = buffer.remove(nextWriteIndex)
+                        onWrite(nextWriteIndex, toWrite)
+                        nextWriteIndex++
+                    }
+                }
+            }
+        }.awaitAll()
     }
 }

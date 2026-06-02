@@ -112,10 +112,8 @@ class VariantPlaylistTracker(
                 if (serverControl?.canBlockReload != true) {
                     val interval = calculateRefreshInterval(state)
                     delay(interval)
-                } else {
-                    // 阻塞请求模式下，短暂延迟避免过快请求
-                    delay(100)
                 }
+                // 阻塞请求模式下无需延迟，服务器有新数据才返回
 
             } catch (e: Exception) {
                 Log.e(TAG, "跟踪播放列表错误: ${e.message}", e)
