@@ -5,7 +5,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -146,12 +148,13 @@ class PartDownloader(
         // 有序缓冲区：序号 -> 数据
         val buffer = TreeMap<Int, ByteArray?>()
         var nextWriteIndex = 0
+        val mutex = Mutex()
 
         // 并行下载
         parts.map { (index, uri) ->
             async(Dispatchers.IO) {
                 val data = downloadWithLimit(uri)
-                synchronized(buffer) {
+                mutex.withLock {
                     buffer[index] = data
                     // 尝试按顺序写入
                     while (buffer.containsKey(nextWriteIndex)) {
