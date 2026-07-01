@@ -189,6 +189,7 @@ class M3U8ParserImpl : M3U8ParserInterface {
                       content.contains("#EXT-X-PRELOAD-HINT")
 
         var i = 0
+        var currentSeq = mediaSequence // 动态序列号计数器
         while (i < lines.size) {
             val line = lines[i].trim()
 
@@ -201,6 +202,7 @@ class M3U8ParserImpl : M3U8ParserInterface {
                 // #EXT-X-MEDIA-SEQUENCE
                 line.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
                     mediaSequence = line.substringAfter(":").toLongOrNull() ?: 0L
+                    currentSeq = mediaSequence // 同步计数器
                 }
 
                 // #EXT-X-PLAYLIST-TYPE
@@ -293,7 +295,8 @@ class M3U8ParserImpl : M3U8ParserInterface {
                             uri = uri,
                             title = title,
                             discontinuity = isDiscontinuity,
-                            key = currentEncryptionKey
+                            key = currentEncryptionKey,
+                            sequenceNumber = currentSeq++
                         ))
                         isDiscontinuity = false
                     }
@@ -301,13 +304,15 @@ class M3U8ParserImpl : M3U8ParserInterface {
 
                 // 直接的 URI 行（没有 EXTINF，兼容性处理）
                 !line.startsWith("#") && line.isNotEmpty() -> {
-                    if (segments.isEmpty() || segments.last().uri != line) {
-                        val uri = resolveUrl(line, baseUrl)
+                    val uri = resolveUrl(line, baseUrl)
+                    // 避免与 #EXTINF 处理重复添加同一 segment（比较已解析的完整 URI）
+                    if (segments.isEmpty() || segments.last().uri != uri) {
                         segments.add(Segment(
                             duration = targetDuration,
                             uri = uri,
                             discontinuity = isDiscontinuity,
-                            key = currentEncryptionKey
+                            key = currentEncryptionKey,
+                            sequenceNumber = currentSeq++
                         ))
                         isDiscontinuity = false
                     }

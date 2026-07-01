@@ -137,7 +137,8 @@ data class Segment(
     val byteRange: String? = null,    // 字节范围
     val discontinuity: Boolean = false, // 是否有不连续标记
     val key: EncryptionKey? = null,   // 加密密钥
-    val mapUri: String? = null        // 该片段专用的 init segment
+    val mapUri: String? = null,       // 该片段专用的 init segment
+    val sequenceNumber: Long = 0L     // 分片序列号 (基于 #EXT-X-MEDIA-SEQUENCE)
 )
 
 /**

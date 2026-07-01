@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 
 object DownloadManager {
     private const val TAG = "DownloadManager"
@@ -40,11 +41,16 @@ object DownloadManager {
     // 优化的 OkHttpClient：大连接池 + HTTP/2 + 快速超时
     private val okHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
-        .connectionPool(ConnectionPool(64, 5, TimeUnit.MINUTES)) // 大连接池支持多任务并发
-        .connectTimeout(3, TimeUnit.SECONDS)  // 快速失败
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(64, 5, TimeUnit.MINUTES))
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(5, TimeUnit.SECONDS)
-        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.HTTP_1_1)) // HTTP/2 优先
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 128
+            maxRequestsPerHost = 20
+        })
+        .dns(CustomDns())
         .addInterceptor { chain ->
             val originalRequest = chain.request()
             val url = originalRequest.url.toString()
@@ -53,8 +59,7 @@ object DownloadManager {
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .header("Accept", "*/*")
 
-            // Chaturbate 流媒体需要 Referer
-            if (url.contains("highwebmedia.com") || url.contains("chaturbate")) {
+            if (url.contains("highwebmedia.com") || url.contains("chaturbate") || url.contains("mmcdn.com")) {
                 builder.header("Referer", "https://chaturbate.com/")
             }
 
@@ -151,23 +156,42 @@ object DownloadManager {
         realtimeMerge: Boolean = true,
         isLive: Boolean = false,
         downloadDirectoryUri: Uri?,
-        preferredResolution: Int? = null
+        preferredResolution: Int? = null,
+        audioTrackUrl: String? = null
     ) {
-        // 异步解析 M3U8 并添加任务
         CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val resolved = analyzeAndResolveUrl(url, preferredResolution)
-
+            if (isLive) {
+                // ---- 直播流：直接创建 LL-HLS 任务，跳过预请求解析 ----
                 withContext(Dispatchers.Main) {
-                    // 对于直播流，如果检测到 LL-HLS 或者无法确定，默认使用 LL-HLS 录制器
-                    val shouldUseLLHls = isLive && (resolved.isLLHls || resolved.videoPlaylistUrl?.contains("llhls") == true)
-
                     val task = DownloadTask(
                         id = "task_${System.currentTimeMillis()}",
                         url = url,
                         fileName = fileName,
                         realtimeMerge = realtimeMerge,
-                        isLive = isLive,
+                        isLive = true,
+                        customDownloadUri = downloadDirectoryUri?.toString(),
+                        isLLHls = true,
+                        audioTrackUrl = audioTrackUrl
+                    )
+                    Log.d(TAG, "addTask (live direct): ${task.id} audio=${audioTrackUrl != null}")
+                    currentTasksState[task.id] = task
+                    notifyQueueChanged()
+                    LiveRecordingService.startService(appContext, task)
+                }
+                return@launch
+            }
+
+            // ---- 非直播流：解析 M3U8（可能是 Master Playlist），选择最佳画质 ----
+            try {
+                val resolved = analyzeAndResolveUrl(url, preferredResolution)
+
+                withContext(Dispatchers.Main) {
+                    val task = DownloadTask(
+                        id = "task_${System.currentTimeMillis()}",
+                        url = url,
+                        fileName = fileName,
+                        realtimeMerge = realtimeMerge,
+                        isLive = false,
                         customDownloadUri = downloadDirectoryUri?.toString(),
                         // Phase 2: Master Playlist 支持
                         isMasterPlaylist = resolved.isMasterPlaylist,
@@ -175,21 +199,14 @@ object DownloadManager {
                         selectedResolution = resolved.selectedVariant?.resolution?.toString(),
                         selectedBandwidth = resolved.selectedVariant?.bandwidth ?: 0L,
                         audioTrackUrl = resolved.audioPlaylistUrl,
-                        selectedVariantLabel = resolved.selectedVariant?.resolution?.getShortLabel(),
-                        // Phase 4: LL-HLS 支持
-                        isLLHls = shouldUseLLHls
+                        selectedVariantLabel = resolved.selectedVariant?.resolution?.getShortLabel()
                     )
 
-                    Log.d(TAG, "addTask: ${task.id} (isLive: $isLive, isMaster: ${resolved.isMasterPlaylist}, isLLHls: $shouldUseLLHls, resolution: ${task.selectedResolution}, videoUrl: ${resolved.videoPlaylistUrl})")
+                    Log.d(TAG, "addTask (vod): ${task.id} (isMaster: ${resolved.isMasterPlaylist}, resolution: ${task.selectedResolution}, videoUrl: ${resolved.videoPlaylistUrl})")
 
                     currentTasksState[task.id] = task
                     notifyQueueChanged()
-
-                    if (isLive) {
-                        LiveRecordingService.startService(appContext, task)
-                    } else {
-                        startDownloadJob(task)
-                    }
+                    startDownloadJob(task)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "解析 M3U8 失败: $url", e)
@@ -200,19 +217,12 @@ object DownloadManager {
                         url = url,
                         fileName = fileName,
                         realtimeMerge = realtimeMerge,
-                        isLive = isLive,
-                        customDownloadUri = downloadDirectoryUri?.toString(),
-                        // 对于直播流，默认尝试 LL-HLS
-                        isLLHls = isLive
+                        isLive = false,
+                        customDownloadUri = downloadDirectoryUri?.toString()
                     )
                     currentTasksState[task.id] = task
                     notifyQueueChanged()
-
-                    if (isLive) {
-                        LiveRecordingService.startService(appContext, task)
-                    } else {
-                        startDownloadJob(task)
-                    }
+                    startDownloadJob(task)
                 }
             }
         }
@@ -484,12 +494,18 @@ object DownloadManager {
         val request = Request.Builder().url(url).build()
         val response = okHttpClient.newCall(request).execute()
 
+        if (!response.isSuccessful) {
+            val errorBody = response.body?.string() ?: "未知错误"
+            Log.e(TAG, "HTTP ${response.code}: $errorBody")
+            throw Exception("HTTP ${response.code}: ${errorBody.take(200)}")
+        }
+
         val body = response.body?.string() ?: throw Exception("响应体为空")
 
         // 检查是否是有效的 M3U8 内容
         if (!body.trim().startsWith("#EXTM3U")) {
-            Log.e(TAG, "返回内容不是有效的 M3U8, 前100字符: ${body.take(100)}")
-            throw Exception("返回内容不是有效的 M3U8 格式")
+            Log.e(TAG, "返回内容不是有效的 M3U8, HTTP=${response.code}, 前100字符: ${body.take(100)}")
+            throw Exception("服务器返回了非 M3U8 内容: ${body.take(100)}")
         }
 
         body

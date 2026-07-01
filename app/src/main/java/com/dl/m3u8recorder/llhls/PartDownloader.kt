@@ -55,6 +55,16 @@ class PartDownloader(
                         Log.v(TAG, "Downloaded: $uri (${bytes.size} bytes), attempt ${attempt + 1}")
                         return@withContext bytes
                     }
+                } else if (response.code in 400..499) {
+                    // 404/429 可能是临时的（live edge 还没准备好 / 限流），重试
+                    // 其他 4xx（400, 401, 403, 405+）永久跳过
+                    if (response.code == 404 || response.code == 429) {
+                        Log.w(TAG, "HTTP ${response.code}: $uri, 可能临时错误，重试 (${attempt + 1}/${MAX_RETRIES})")
+                        lastException = IOException("HTTP ${response.code}")
+                    } else {
+                        Log.w(TAG, "HTTP ${response.code}: $uri, 跳过 (永久 4xx 错误)")
+                        return@withContext null
+                    }
                 } else {
                     Log.w(TAG, "HTTP ${response.code}: $uri, attempt ${attempt + 1}")
                 }

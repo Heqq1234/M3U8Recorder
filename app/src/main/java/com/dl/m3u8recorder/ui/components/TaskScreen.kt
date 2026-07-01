@@ -28,6 +28,7 @@ import com.dl.m3u8recorder.utils.Mp4OutputHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.dl.m3u8recorder.llhls.ChaturbateApi
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -55,6 +56,10 @@ fun TaskScreen(
     var isAnalyzingUrl by remember { mutableStateOf(false) }
     var autoSelectBest by remember { mutableStateOf(true) }
     var analysisError by remember { mutableStateOf<String?>(null) }
+
+    // Phase 5: Chaturbate 房间模式
+    val chaturbateRoomSlug = remember(url) { ChaturbateApi.extractRoomSlug(url) }
+    var showChaturbateDialog by remember { mutableStateOf(false) }
 
     // 检测输入是否为 M3U8 内容
     LaunchedEffect(url) {
@@ -177,9 +182,83 @@ fun TaskScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(4.dp))
+        // --- Phase 5: Chaturbate 房间模式 ---
+        chaturbateRoomSlug?.let { room ->
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = "Chaturbate 房间: $room",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "App 将通过 WebView 连接房间，自动获取直播流地址",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = filename,
+                            onValueChange = { filename = it },
+                            label = { Text("文件名") },
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                if (filename.isNotBlank()) {
+                                    showChaturbateDialog = true
+                                }
+                            },
+                            enabled = filename.isNotBlank()
+                        ) {
+                            Text("连接并录制", fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            // 不显示后面的文件名输入框等标准控件
+            // 实际通过后续的 if 条件控制
+        }
 
-        // --- 文件名输入框 ---
+        // --- 保存路径（所有模式下可见） ---
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp)
+                .clickable { openDirectoryLauncher.launch(downloadDirectoryUri) }
+                .padding(vertical = 4.dp),
+            horizontalAlignment = Alignment.Start
+        ) {
+            Text(text = "保存路径:", style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = customDownloadPath,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // 非 Chaturbate 模式才显示标准控件
+        if (chaturbateRoomSlug == null) {
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // --- 文件名输入框 ---
         OutlinedTextField(
             value = filename,
             onValueChange = { filename = it },
@@ -346,24 +425,6 @@ fun TaskScreen(
             }
         }
 
-        // --- 保存路径 ---
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp)
-                .clickable { openDirectoryLauncher.launch(downloadDirectoryUri) }
-                .padding(vertical = 4.dp),
-            horizontalAlignment = Alignment.Start
-        ) {
-            Text(text = "保存路径:", style = MaterialTheme.typography.labelLarge)
-            Text(
-                text = customDownloadPath,
-                fontSize = 11.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-
         // 显示提取的最佳流 URL
         extractedBestUrl?.let { bestUrl ->
             Text(
@@ -434,6 +495,28 @@ fun TaskScreen(
             enabled = url.isNotBlank() && filename.isNotBlank() && (!isM3U8Content || selectedVariant != null || extractedBestUrl != null)
         ) {
             Text("添加下载任务")
+        }
+
+        } // 结束 if (chaturbateRoomSlug == null)
+
+        // --- Chaturbate 连接对话框 ---
+        if (showChaturbateDialog && chaturbateRoomSlug != null) {
+            ChaturbateConnectDialog(
+                roomSlug = chaturbateRoomSlug,
+                onDismiss = { showChaturbateDialog = false },
+                onStreamUrlObtained = { videoUrl, audioUrl ->
+                    showChaturbateDialog = false
+                    Log.d("TaskScreen", "Chaturbate 获取到流地址，开始录制...")
+                    DownloadManager.addTask(
+                        url = videoUrl,
+                        fileName = filename.ifBlank { chaturbateRoomSlug },
+                        isLive = true,
+                        downloadDirectoryUri = downloadDirectoryUri,
+                        audioTrackUrl = audioUrl
+                    )
+                    filename = ""
+                }
+            )
         }
 
         Divider(modifier = Modifier.padding(vertical = 8.dp))

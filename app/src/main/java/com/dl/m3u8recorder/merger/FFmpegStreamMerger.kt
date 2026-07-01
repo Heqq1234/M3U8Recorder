@@ -2,6 +2,7 @@ package com.dl.m3u8recorder.merger
 
 import android.util.Log
 import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -47,12 +48,11 @@ class FFmpegStreamMerger(
 
             // Phase 1: 添加时间戳修正参数解决音画不同步问题
             val command = listOf(
-                "-fflags", "+genpts+igndts",
+                "-fflags", "+genpts",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", concatFile.absolutePath,
                 "-avoid_negative_ts", "make_zero",
-                "-max_interleave_delta", "0",
                 "-c", "copy",
                 "-movflags", "+faststart",
                 outputFile.absolutePath
@@ -61,7 +61,7 @@ class FFmpegStreamMerger(
 
             val session = FFmpegKit.execute(command)
 
-            if (session.returnCode.isSuccess) {
+            if (ReturnCode.isSuccess(session.returnCode)) {
                 Log.d(TAG, "合并完成: ${outputFile.absolutePath}")
             } else {
                 Log.e(TAG, "合并失败: ${session.failStackTrace}")

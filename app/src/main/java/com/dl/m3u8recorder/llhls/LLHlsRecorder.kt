@@ -2,10 +2,7 @@ package com.dl.m3u8recorder.llhls
 
 import android.content.Context
 import android.util.Log
-import com.dl.m3u8recorder.manager.DownloadManager
 import com.dl.m3u8recorder.model.DownloadTask
-import com.dl.m3u8recorder.parser.InitSegment
-import com.dl.m3u8recorder.parser.Part
 import com.dl.m3u8recorder.parser.Segment
 import com.dl.m3u8recorder.utils.Mp4OutputHelper
 import kotlinx.coroutines.*
@@ -15,7 +12,6 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * LL-HLS 主录制器
- * 编排所有 LL-HLS 录制组件
  */
 class LLHlsRecorder(
     private val context: Context,
@@ -27,19 +23,16 @@ class LLHlsRecorder(
         private const val TAG = "LLHlsRecorder"
     }
 
-    // 活跃的录制会话
     private val activeSessions = ConcurrentHashMap<String, RecordingSession>()
-
-    // 组件
+    private val globalProgressCounters = ConcurrentHashMap<String, Int>()
     private val partDownloader = PartDownloader(okHttpClient)
-    private val streamMuxer = StreamMuxer()
+    private val muxer = PipeMuxer()
 
-    /**
-     * 录制会话
-     */
     private data class RecordingSession(
         val taskId: String,
         val task: DownloadTask,
+        val syncCoordinator: SyncCoordinator,
+        val outputFile: File,
         val videoAppender: CmafAppender?,
         val audioAppender: CmafAppender?,
         val videoTracker: VariantPlaylistTracker?,
@@ -52,9 +45,6 @@ class LLHlsRecorder(
         var isStopped: Boolean = false
     )
 
-    /**
-     * 开始 LL-HLS 录制
-     */
     suspend fun startRecording(
         task: DownloadTask,
         onProgress: (progress: Int, status: String) -> Unit
@@ -67,18 +57,16 @@ class LLHlsRecorder(
         onProgress(0, "初始化 LL-HLS 录制...")
 
         try {
-            // 确定视频和音频 playlist URL
             val videoPlaylistUrl = task.getEffectiveUrl()
             val audioPlaylistUrl = task.audioTrackUrl
+            Log.d(TAG, "URL debug: effectiveUrl=$videoPlaylistUrl audioUrl=$audioPlaylistUrl")
 
-            // 创建输出文件
             val outputDir = Mp4OutputHelper.getOutputFile(context, task.fileName, "")
                 .parentFile ?: context.cacheDir
-
+            val outputFile = File(outputDir, "${task.fileName}.mp4").apply { parentFile?.mkdirs() }
             val videoFile = File(outputDir, "${task.id}_video.mp4")
             val audioFile = File(outputDir, "${task.id}_audio.mp4")
 
-            // 初始化组件
             val videoTracker = VariantPlaylistTracker(okHttpClient)
             val audioTracker = audioPlaylistUrl?.let { VariantPlaylistTracker(okHttpClient) }
 
@@ -87,32 +75,37 @@ class LLHlsRecorder(
 
             val videoDeduplicator = FragmentDeduplicator()
             val audioDeduplicator = FragmentDeduplicator()
+            val syncCoordinator = SyncCoordinator()
 
             val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
             onProgress(1, "获取播放列表信息...")
-
-            // 获取初始播放列表状态
             val videoState = videoTracker.fetchOnce(videoPlaylistUrl)
-
             if (videoState == null) {
                 onProgress(0, "无法获取播放列表")
                 return@withContext
             }
 
-            // 下载初始化片段
             if (videoState.initSegment != null) {
                 onProgress(2, "下载视频初始化片段...")
-                val initData = partDownloader.downloadInitSegment(videoState.initSegment.uri)
-                if (initData != null) {
-                    videoAppender.writeInitSegment(initData)
+                partDownloader.downloadInitSegment(videoState.initSegment.uri)?.let {
+                    videoAppender.writeInitSegment(it)
+                }
+            }
+            if (audioPlaylistUrl != null) {
+                audioTracker?.fetchOnce(audioPlaylistUrl)?.initSegment?.let {
+                    onProgress(3, "下载音频初始化片段...")
+                    partDownloader.downloadInitSegment(it.uri)?.let { d ->
+                        audioAppender?.writeInitSegment(d)
+                    }
                 }
             }
 
-            // 创建录制会话
             val session = RecordingSession(
                 taskId = task.id,
                 task = task,
+                syncCoordinator = syncCoordinator,
+                outputFile = outputFile,
                 videoAppender = videoAppender,
                 audioAppender = audioAppender,
                 videoTracker = videoTracker,
@@ -125,74 +118,50 @@ class LLHlsRecorder(
             )
 
             activeSessions[task.id] = session
-
             onProgress(5, "开始录制...")
 
-            // 启动视频轨道录制
             val videoJob = scope.launch {
-                videoTracker.trackPlaylist(
-                    playlistUrl = videoPlaylistUrl,
-                    onInitSegment = { initSeg ->
-                        downloadAndWriteInit(videoAppender, initSeg)
-                    },
-                    onNewSegments = { segments ->
-                        downloadAndAppendSegments(
-                            segments,
-                            videoAppender,
-                            videoDeduplicator,
-                            session,
-                            onProgress
-                        )
-                    },
-                    onNewParts = { parts ->
-                        downloadAndAppendParts(
-                            parts,
-                            videoAppender,
-                            videoDeduplicator,
-                            session,
-                            onProgress
-                        )
-                    }
-                )
-            }
-
-            // 启动音频轨道录制（如果有）
-            val audioJob = audioPlaylistUrl?.let { audioUrl ->
-                scope.launch {
-                    audioTracker?.trackPlaylist(
-                        playlistUrl = audioUrl,
-                        onInitSegment = { initSeg ->
-                            audioAppender?.let { downloadAndWriteInit(it, initSeg) }
-                        },
+                try {
+                    videoTracker.trackPlaylist(
+                        playlistUrl = videoPlaylistUrl,
+                        onInitSegment = {},
                         onNewSegments = { segments ->
-                            downloadAndAppendSegments(
-                                segments,
-                                audioAppender,
-                                audioDeduplicator,
-                                session,
-                                onProgress
-                            )
-                        },
-                        onNewParts = { parts ->
-                            downloadAndAppendParts(
-                                parts,
-                                audioAppender,
-                                audioDeduplicator,
-                                session,
-                                onProgress
-                            )
+                            appendSegments(segments, videoAppender, videoDeduplicator, session, onProgress)
                         }
                     )
+                } finally {
+                    session.syncCoordinator.finalize(SyncCoordinator.StreamType.VIDEO)
                 }
             }
 
-            // 更新会话中的 Job
-            activeSessions[task.id] = session.copy(
-                videoJob = videoJob,
-                audioJob = audioJob
-            )
+            val audioJob = audioPlaylistUrl?.let { audioUrl ->
+                scope.launch {
+                    try {
+                        audioTracker?.trackPlaylist(
+                            playlistUrl = audioUrl,
+                            onInitSegment = {},
+                            onNewSegments = { segments ->
+                                appendSegments(segments, audioAppender, audioDeduplicator, session, onProgress)
+                            },
+                            isOtherTrackerActive = {
+                                val active = videoJob.isActive
+                                Log.d(TAG, "audio isOtherTrackerActive check: videoJob.active=$active")
+                                active
+                            }
+                        )
+                    } finally {
+                        session.syncCoordinator.finalize(SyncCoordinator.StreamType.AUDIO)
+                        Log.d(TAG, "Audio tracker finalized, videoJob.isActive=${videoJob.isActive}")
+                    }
+                }
+            }
 
+            activeSessions[task.id] = session.copy(videoJob = videoJob, audioJob = audioJob)
             Log.d(TAG, "LL-HLS recording started: ${task.id}")
+
+            videoJob.join()
+            audioJob?.join()
+            Log.d(TAG, "LL-HLS recording finished: ${task.id}")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start LL-HLS recording", e)
@@ -201,68 +170,49 @@ class LLHlsRecorder(
     }
 
     /**
-     * 停止录制并生成最终文件
+     * 停止录制 → mux 音视频（两遍 mux 修正 PTS）
      */
-    suspend fun stopRecording(taskId: String, outputFile: File): Boolean = withContext(Dispatchers.IO) {
-        val session = activeSessions.remove(taskId)
-
-        if (session == null) {
-            Log.w(TAG, "No active session for task: $taskId")
-            return@withContext false
-        }
-
+    suspend fun stopRecording(taskId: String): File? = withContext(Dispatchers.IO) {
+        val session = activeSessions.remove(taskId) ?: return@withContext null
         session.isStopped = true
-
-        // 取消协程
-        session.videoJob?.cancel()
-        session.audioJob?.cancel()
+        session.videoJob?.let { it.cancel(); it.join() }
+        session.audioJob?.let { it.cancel(); it.join() }
         session.scope.cancel()
 
-        // 刷新追加器
         session.videoAppender?.flush()
         session.audioAppender?.flush()
 
-        // 合成最终文件
-        val success = if (session.audioAppender != null) {
-            // 有独立音频轨，需要合成
-            streamMuxer.muxWithTimestampFix(
-                videoFile = session.videoAppender!!.getOutputFile(),
-                audioFile = session.audioAppender!!.getOutputFile(),
-                outputFile = outputFile
-            )
-        } else {
-            // 只有视频轨
-            streamMuxer.copySingleStream(
-                videoFile = session.videoAppender!!.getOutputFile(),
-                outputFile = outputFile
-            )
-        }
+        val padInfo = session.syncCoordinator.getPadInfo()
+        val startMismatchMs = session.syncCoordinator.getStartMismatchMs()
+        Log.d(TAG, "startMismatchMs=$startMismatchMs padInfo=$padInfo")
+        Log.d(TAG, "SyncCoordinator: ${session.syncCoordinator}")
+        val success = muxer.mux(
+            videoFile = session.videoAppender!!.getOutputFile(),
+            audioFile = session.audioAppender!!.getOutputFile(),
+            outputFile = session.outputFile,
+            padInfo = padInfo,
+            startMismatchMs = startMismatchMs
+        )
 
-        // 清理临时文件
         session.videoAppender?.getOutputFile()?.delete()
         session.audioAppender?.getOutputFile()?.delete()
+        globalProgressCounters.remove(taskId)
 
-        Log.d(TAG, "LL-HLS recording stopped: $taskId, success=$success")
-        success
+        if (success) session.outputFile else null
     }
 
-    /**
-     * 下载并写入初始化片段
-     */
-    private suspend fun downloadAndWriteInit(
-        appender: CmafAppender,
-        initSegment: InitSegment
-    ) {
-        val data = partDownloader.downloadInitSegment(initSegment.uri)
-        if (data != null) {
-            appender.writeInitSegment(data)
-        }
+    fun cancelRecording(taskId: String) {
+        val session = activeSessions.remove(taskId) ?: return
+        session.isStopped = true
+        session.videoJob?.cancel()
+        session.audioJob?.cancel()
+        session.scope.cancel()
+        session.videoAppender?.flush()
+        session.audioAppender?.flush()
+        globalProgressCounters.remove(taskId)
     }
 
-    /**
-     * 下载并追加完整片段
-     */
-    private suspend fun downloadAndAppendSegments(
+    private suspend fun appendSegments(
         segments: List<Segment>,
         appender: CmafAppender?,
         deduplicator: FragmentDeduplicator,
@@ -270,89 +220,34 @@ class LLHlsRecorder(
         onProgress: (Int, String) -> Unit
     ) {
         if (appender == null || session.isStopped) return
+        val newSegments = segments.filter { deduplicator.markSegmentDownloaded(it.uri) }
+        if (newSegments.isEmpty()) return
 
-        for (segment in segments) {
-            if (session.isStopped) break
-
-            // 去重
-            if (!deduplicator.markSegmentDownloaded(segment.uri)) {
-                continue
-            }
-
-            val data = partDownloader.download(segment.uri)
-            if (data != null) {
-                appender.appendFragment(data)
-
-                val count = appender.getFragmentCount()
-                onProgress(
-                    (5 + count % 90),
-                    "下载片段 #$count"
-                )
-            }
-        }
-    }
-
-    /**
-     * 下载并追加部分片段（并行下载 + 有序写入 + 全局并发限制）
-     */
-    private suspend fun downloadAndAppendParts(
-        parts: List<Part>,
-        appender: CmafAppender?,
-        deduplicator: FragmentDeduplicator,
-        session: RecordingSession,
-        onProgress: (Int, String) -> Unit
-    ) {
-        if (appender == null || session.isStopped) return
-
-        // 过滤未下载的部分片段
-        val newParts = parts.filter { deduplicator.markPartDownloaded(it.uri) }
-
-        if (newParts.isEmpty()) return
-
-        // 带序号的 URI 列表
-        val indexedUris = newParts.mapIndexed { index, part -> index to part.uri }
-
-        // 并行下载，按顺序写入
-        partDownloader.downloadParallelOrdered(indexedUris) { index, data ->
+        partDownloader.downloadParallelOrdered(
+            newSegments.mapIndexed { i, s -> i to s.uri }
+        ) { index, data ->
             if (session.isStopped) return@downloadParallelOrdered
-
             if (data != null) {
                 appender.appendFragment(data)
-
-                val count = appender.getFragmentCount()
-                onProgress(
-                    (5 + count % 90),
-                    "下载部分片段 #$count"
+                val seg = newSegments[index]
+                val ms = (seg.duration * 1000).toLong()
+                session.syncCoordinator.addSegment(
+                    if (appender == session.videoAppender) SyncCoordinator.StreamType.VIDEO
+                    else SyncCoordinator.StreamType.AUDIO,
+                    ms,
+                    seg.sequenceNumber
                 )
+                val cnt = globalProgressCounters.compute(session.taskId) { _, v -> (v ?: 0) + 1 } ?: 1
+                onProgress((5 + (cnt % 90)), "下载片段 #$cnt")
             }
         }
     }
 
-    /**
-     * 暂停录制
-     */
     fun pauseRecording(taskId: String) {
-        activeSessions[taskId]?.let { session ->
-            session.videoJob?.cancel()
-            session.audioJob?.cancel()
-            session.videoAppender?.flush()
-            session.audioAppender?.flush()
+        activeSessions[taskId]?.let {
+            it.videoJob?.cancel(); it.audioJob?.cancel()
         }
     }
 
-    /**
-     * 恢复录制
-     */
-    suspend fun resumeRecording(taskId: String, onProgress: (Int, String) -> Unit) {
-        activeSessions[taskId]?.let { session ->
-            // 重新启动跟踪
-            // 注：完整实现需要保存和恢复状态
-            startRecording(session.task, onProgress)
-        }
-    }
-
-    /**
-     * 检查是否有活跃会话
-     */
     fun hasActiveSession(taskId: String): Boolean = activeSessions.containsKey(taskId)
 }

@@ -31,8 +31,8 @@ class VariantPlaylistTracker(
 
     // 追踪状态
     private var lastMediaSequence: Long = -1
-    private var lastSegmentIndex: Int = -1  // 最后的片段序号
-    private var lastPartIndex: Int = -1     // 最后的部分片段索引
+    private var lastSegmentIndex: Int = -1  // 最后的片段序号（仅日志用）
+    private var lastKnownSegmentCount: Int = 0  // 上次 playlists 的片段数量，用于 detectNewSegments
     private var currentInitSegment: InitSegment? = null
     private var serverControl: ServerControl? = null
     private var partTarget: Double = DEFAULT_PART_TARGET
@@ -62,62 +62,77 @@ class VariantPlaylistTracker(
     /**
      * 跟踪播放列表并回调新片段
      * 支持 LL-HLS 阻塞请求
+     *
+     * @param isOtherTrackerActive 可选的检查函数，如果返回 true 表示其他轨道的 tracker 还在运行，
+     *                             此时即使达到最大错误数也不会停止（因为流还活着）
      */
     suspend fun trackPlaylist(
         playlistUrl: String,
-        onNewParts: suspend (List<Part>) -> Unit,
         onNewSegments: suspend (List<Segment>) -> Unit,
-        onInitSegment: suspend (InitSegment) -> Unit
+        onInitSegment: suspend (InitSegment) -> Unit,
+        isOtherTrackerActive: () -> Boolean = { false }
     ) = withContext(Dispatchers.IO) {
         Log.d(TAG, "开始跟踪 LL-HLS 播放列表: $playlistUrl")
 
+        var consecutiveErrors = 0
+        val maxErrors = 10  // 连续 10 次失败则认为流已结束
+
         while (isActive) {
             try {
-                // 构建请求 URL（支持阻塞请求）
                 val requestUrl = buildBlockingRequestUrl(playlistUrl)
-
                 val state = fetchAndParse(requestUrl)
 
-                // 更新服务器控制信息
+                consecutiveErrors = 0
+
+                if (!state.isLive) {
+                    Log.d(TAG, "播放列表包含 ENDLIST 标记，直播流已结束")
+                    if (state.segments.isNotEmpty()) {
+                        onNewSegments(state.segments)
+                    }
+                    return@withContext
+                }
+
                 state.serverControl?.let {
                     serverControl = it
                     Log.d(TAG, "服务器控制: CAN-BLOCK-RELOAD=${it.canBlockReload}, PART-HOLD-BACK=${it.partHoldBack}")
                 }
 
-                // 处理初始化片段 (#EXT-X-MAP)
                 if (state.initSegment != null && state.initSegment != currentInitSegment) {
                     currentInitSegment = state.initSegment
                     Log.d(TAG, "新初始化片段: ${state.initSegment.uri}")
                     onInitSegment(state.initSegment)
                 }
 
-                // 检测新的完整片段
                 val newSegments = detectNewSegments(state)
                 if (newSegments.isNotEmpty()) {
                     Log.d(TAG, "发现 ${newSegments.size} 个新完整片段")
                     onNewSegments(newSegments)
                 }
 
-                // 检测新的部分片段
-                val newParts = detectNewParts(state)
-                if (newParts.isNotEmpty()) {
-                    Log.d(TAG, "发现 ${newParts.size} 个新部分片段")
-                    onNewParts(newParts)
-                }
-
-                // 更新追踪状态
                 updateTrackingState(state)
 
-                // 如果服务器不支持阻塞请求，使用延迟
                 if (serverControl?.canBlockReload != true) {
                     val interval = calculateRefreshInterval(state)
                     delay(interval)
                 }
-                // 阻塞请求模式下无需延迟，服务器有新数据才返回
 
             } catch (e: Exception) {
-                Log.e(TAG, "跟踪播放列表错误: ${e.message}", e)
-                delay(1000) // 出错后等待 1 秒重试
+                consecutiveErrors++
+                Log.e(TAG, "获取播放列表失败 (${consecutiveErrors}/${maxErrors}): ${e.message}")
+
+                if (consecutiveErrors >= maxErrors) {
+                    val otherActive = isOtherTrackerActive()
+                    Log.d(TAG, "连续 $maxErrors 次获取失败，isOtherTrackerActive=$otherActive")
+                    if (otherActive) {
+                        Log.w(TAG, "连续 $maxErrors 次获取失败，但其他轨道还在运行，继续重试...")
+                        consecutiveErrors = maxErrors / 2
+                    } else {
+                        Log.e(TAG, "连续 $maxErrors 次获取失败，直播流已结束，停止跟踪")
+                        return@withContext
+                    }
+                }
+
+                delay(1000)
             }
         }
     }
@@ -135,30 +150,28 @@ class VariantPlaylistTracker(
         }
 
         // 如果还没有追踪状态，不添加阻塞参数
-        if (lastSegmentIndex < 0) {
+        if (lastMediaSequence < 0) {
             return baseUrl
         }
 
         val urlBuilder = StringBuilder(baseUrl)
         val separator = if (baseUrl.contains("?")) "&" else "?"
 
-        // 下一个期望的片段序号
-        val nextMsn = lastSegmentIndex + 1
+        // 下一个期望的片段序号 = 首个片段的媒体序列号 + 已知片段总数
+        // 按 LL-HLS 协议，_HLS_msn 是媒体序列号，不是文件名里的编号
+        val nextMsn = lastMediaSequence + lastKnownSegmentCount
         urlBuilder.append("${separator}_HLS_msn=$nextMsn")
 
-        // 如果有部分片段索引，添加 part 参数
-        if (lastPartIndex >= 0) {
-            val nextPart = lastPartIndex + 1
-            urlBuilder.append("&_HLS_part=$nextPart")
-        }
-
-        Log.v(TAG, "阻塞请求: msn=$nextMsn, part=${if (lastPartIndex >= 0) lastPartIndex + 1 else "none"}")
+        Log.v(TAG, "阻塞请求: mediaSeq=$lastMediaSequence count=$lastKnownSegmentCount msn=$nextMsn")
 
         return urlBuilder.toString()
     }
 
     /**
      * 检测新的完整片段
+     *
+     * 音视频 trackers 各自独立运行，不在此函数内做跨轨道同步。
+     * 同步在 LLHlsRecorder 层通过 SyncCoordinator 处理。
      */
     private fun detectNewSegments(state: PlaylistState): List<Segment> {
         if (lastMediaSequence < 0) {
@@ -167,69 +180,25 @@ class VariantPlaylistTracker(
         }
 
         if (state.mediaSequence > lastMediaSequence) {
-            // 新的媒体序列，计算新增的片段
+            // 媒体序列增加了，计算新增的片段
             val sequenceDiff = (state.mediaSequence - lastMediaSequence).toInt()
 
-            // 如果序列号增加，表示有新片段
-            // LL-HLS 中，每个媒体序列通常对应一个完整片段
             return if (sequenceDiff <= state.segments.size) {
                 state.segments.takeLast(sequenceDiff)
             } else {
+                // 序列号跳了太多（阻塞请求返回时窗口已滑过），全部返回，下游去重
                 state.segments
             }
         }
 
+        // state.mediaSequence == lastMediaSequence
+        // 某些 CDN 不改变 mediaSequence 也会追加新片段（滑动窗口末尾增加）
+        if (state.segments.size > lastKnownSegmentCount) {
+            val newCount = state.segments.size - lastKnownSegmentCount
+            return state.segments.takeLast(newCount)
+        }
+
         return emptyList()
-    }
-
-    /**
-     * 检测新的部分片段
-     */
-    private fun detectNewParts(state: PlaylistState): List<Part> {
-        val parts = state.parts
-
-        if (parts.isEmpty()) {
-            return emptyList()
-        }
-
-        if (lastSegmentIndex < 0) {
-            // 首次获取，返回所有独立的部分片段
-            Log.d(TAG, "首次获取，返回 ${parts.filter { it.independent }.size} 个独立部分片段")
-            return parts.filter { it.independent }
-        }
-
-        // 找到上次之后的部分片段
-        val newParts = mutableListOf<Part>()
-
-        for (part in parts) {
-            val info = extractPartInfo(part.uri)
-            if (info != null) {
-                // 比较 (segmentIndex, partIndex) 元组
-                if (info.segmentIndex > lastSegmentIndex ||
-                    (info.segmentIndex == lastSegmentIndex && info.partIndex > lastPartIndex)) {
-                    newParts.add(part)
-                }
-            }
-        }
-
-        return newParts
-    }
-
-    /**
-     * 从 URI 中提取部分片段信息
-     * 例如: part_0_5036_0_video_xxx.m4s -> PartInfo(segmentIndex=5036, partIndex=0)
-     */
-    private data class PartInfo(val segmentIndex: Int, val partIndex: Int)
-
-    private fun extractPartInfo(uri: String): PartInfo? {
-        // 匹配: part_0_5036_0_video_xxx.m4s
-        // 格式: part_<track>_<segment>_<part>_video_...
-        val partMatch = Regex("""part_\d+_(\d+)_(\d+)_""").find(uri)
-        return partMatch?.let {
-            val segmentIndex = it.groupValues[1].toIntOrNull() ?: return null
-            val partIndex = it.groupValues[2].toIntOrNull() ?: return null
-            PartInfo(segmentIndex, partIndex)
-        }
     }
 
     /**
@@ -247,36 +216,17 @@ class VariantPlaylistTracker(
      */
     private fun updateTrackingState(state: PlaylistState) {
         lastMediaSequence = state.mediaSequence
+        lastKnownSegmentCount = state.segments.size
 
-        // 从完整片段中更新最后的片段序号
+        // 从完整片段中更新最后的片段序号（仅用于日志）
         if (state.segments.isNotEmpty()) {
             val lastSegment = state.segments.last()
             extractSegmentIndex(lastSegment.uri)?.let {
                 if (it > lastSegmentIndex) {
                     lastSegmentIndex = it
-                    lastPartIndex = -1 // 新片段开始，重置部分索引
                     Log.d(TAG, "更新片段序号: $lastSegmentIndex")
                 }
             }
-        }
-
-        // 更新最后的部分片段索引
-        if (state.parts.isNotEmpty()) {
-            val lastPart = state.parts.last()
-            val info = extractPartInfo(lastPart.uri)
-            if (info != null) {
-                // 更新片段序号和部分索引
-                if (info.segmentIndex > lastSegmentIndex || lastSegmentIndex < 0) {
-                    lastSegmentIndex = info.segmentIndex
-                }
-                lastPartIndex = info.partIndex
-                Log.d(TAG, "更新部分片段: segment=$lastSegmentIndex, part=$lastPartIndex")
-            }
-        }
-
-        // 更新部分片段目标时长
-        if (state.parts.isNotEmpty()) {
-            partTarget = state.parts.first().duration.coerceIn(0.2, 2.0)
         }
     }
 
@@ -295,7 +245,7 @@ class VariantPlaylistTracker(
     /**
      * 获取并解析播放列表
      */
-    private suspend fun fetchAndParse(url: String): PlaylistState = withContext(Dispatchers.IO) {
+    private suspend fun fetchAndParse(url: String, depth: Int = 0): PlaylistState = withContext(Dispatchers.IO) {
         // 请求头由 client 的 interceptor 统一设置
         val request = Request.Builder()
             .url(url)
@@ -304,7 +254,9 @@ class VariantPlaylistTracker(
         val response = blockingClient.newCall(request).execute()
 
         if (!response.isSuccessful) {
-            throw Exception("HTTP ${response.code}: $url")
+            val errorBody = try { response.body?.string() } catch (_: Exception) { null }
+            Log.e(TAG, "HTTP ${response.code}: ${errorBody ?: "无响应体"}")
+            throw Exception("HTTP ${response.code}: ${errorBody?.take(200) ?: url}")
         }
 
         val content = response.body?.string() ?: throw Exception("Empty response")
@@ -331,7 +283,18 @@ class VariantPlaylistTracker(
                 )
             }
             is M3U8Playlist.Master -> {
-                throw Exception("Expected Media Playlist but got Master Playlist")
+                // Master Playlist 自动选择最佳变体重新获取（最多一层递归）
+                if (playlist.variants.isEmpty()) {
+                    throw Exception("Master Playlist has no variants")
+                }
+                if (depth >= 1) {
+                    throw Exception("Max recursion depth reached resolving Master Playlist")
+                }
+                val bestVariant = parser.selectBestVariant(playlist.variants)
+                Log.w(TAG, "传入 URL 是 Master Playlist (${playlist.variants.size} 变体)，自动选择最佳变体: " +
+                        "${bestVariant.resolution} (${bestVariant.bandwidth / 1000}kbps) url=${bestVariant.uri}")
+                // 递归获取最佳变体 Media Playlist（最多一层）
+                fetchAndParse(bestVariant.uri, depth + 1)
             }
         }
     }
@@ -360,7 +323,7 @@ class VariantPlaylistTracker(
     fun reset() {
         lastMediaSequence = -1
         lastSegmentIndex = -1
-        lastPartIndex = -1
+        lastKnownSegmentCount = 0
         currentInitSegment = null
         serverControl = null
         Log.d(TAG, "VariantPlaylistTracker reset")

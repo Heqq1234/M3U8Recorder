@@ -9,16 +9,19 @@ import java.io.*
  */
 class CmafAppender(
     private val outputFile: File,
-    private val bufferSize: Int = 64 * 1024
+    private val bufferSize: Int = 256 * 1024
 ) {
     companion object {
         private const val TAG = "CmafAppender"
+        private const val FLUSH_INTERVAL_FRAGMENTS = 5
+        private const val FLUSH_INTERVAL_BYTES = 1024 * 1024
     }
 
     private var outputStream: BufferedOutputStream? = null
     private var initSegmentWritten = false
     private var fragmentCount = 0
     private var totalBytesWritten = 0L
+    private var bytesSinceLastFlush = 0L
 
     /**
      * 写入初始化片段 (来自 EXT-X-MAP)
@@ -67,10 +70,12 @@ class CmafAppender(
             outputStream?.write(data)
             fragmentCount++
             totalBytesWritten += data.size
+            bytesSinceLastFlush += data.size
 
-            // 每 10 个片段刷新一次
-            if (fragmentCount % 10 == 0) {
+            // 每 5 个片段或每 1MB 刷新一次，平衡延迟和 IO 效率
+            if (fragmentCount % FLUSH_INTERVAL_FRAGMENTS == 0 || bytesSinceLastFlush >= FLUSH_INTERVAL_BYTES) {
                 outputStream?.flush()
+                bytesSinceLastFlush = 0
             }
 
             Log.v(TAG, "Fragment #$fragmentCount appended: ${data.size} bytes")
