@@ -54,7 +54,11 @@ data class DownloadTask(
     val lastPartIndex: Int = 0,
 
     /** 已下载的片段数 */
-    val downloadedFragmentCount: Int = 0
+    val downloadedFragmentCount: Int = 0,
+
+    val isScheduled: Boolean = false,
+
+    val scheduledStartTime: Long = 0L
 
 ) : Parcelable {
 

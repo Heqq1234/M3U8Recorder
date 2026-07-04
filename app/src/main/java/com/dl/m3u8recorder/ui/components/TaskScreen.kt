@@ -29,6 +29,50 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.dl.m3u8recorder.llhls.ChaturbateApi
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+
+@Composable
+fun NumberPicker(
+    value: Int,
+    onValueChange: (Int) -> Unit,
+    minValue: Int,
+    maxValue: Int
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Button(
+            onClick = {
+                if (value > minValue) {
+                    onValueChange(value - 1)
+                }
+            },
+            modifier = Modifier.size(32.dp),
+            contentPadding = PaddingValues(0.dp),
+            enabled = value > minValue
+        ) {
+            Text("-", fontSize = 16.sp)
+        }
+        Text(
+            text = String.format("%02d", value),
+            fontSize = 20.sp,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            modifier = Modifier.width(48.dp)
+        )
+        Button(
+            onClick = {
+                if (value < maxValue) {
+                    onValueChange(value + 1)
+                }
+            },
+            modifier = Modifier.size(32.dp),
+            contentPadding = PaddingValues(0.dp),
+            enabled = value < maxValue
+        ) {
+            Text("+", fontSize = 16.sp)
+        }
+    }
+}
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -43,7 +87,7 @@ fun TaskScreen(
     var url by remember { mutableStateOf("") }
     var filename by remember { mutableStateOf("") }
     var realtimeMerge by remember { mutableStateOf(true) }
-    var isLive by remember { mutableStateOf(false) }
+    var isLive by remember { mutableStateOf(true) }
 
     // M3U8 内容粘贴支持
     var isM3U8Content by remember { mutableStateOf(false) }
@@ -60,6 +104,12 @@ fun TaskScreen(
     // Phase 5: Chaturbate 房间模式
     val chaturbateRoomSlug = remember(url) { ChaturbateApi.extractRoomSlug(url) }
     var showChaturbateDialog by remember { mutableStateOf(false) }
+
+    // 定时任务相关状态
+    var isScheduled by remember { mutableStateOf(false) }
+    var selectedHour by remember { mutableStateOf(0) }
+    var selectedMinute by remember { mutableStateOf(0) }
+    var showTimePicker by remember { mutableStateOf(false) }
 
     // 检测输入是否为 M3U8 内容
     LaunchedEffect(url) {
@@ -226,14 +276,12 @@ fun TaskScreen(
                             },
                             enabled = filename.isNotBlank()
                         ) {
-                            Text("连接并录制", fontSize = 13.sp)
+                            Text(if (isScheduled) "定时录制" else "连接并录制", fontSize = 13.sp)
                         }
                     }
                 }
             }
             Spacer(modifier = Modifier.height(4.dp))
-            // 不显示后面的文件名输入框等标准控件
-            // 实际通过后续的 if 条件控制
         }
 
         // --- 保存路径（所有模式下可见） ---
@@ -254,6 +302,35 @@ fun TaskScreen(
             )
         }
 
+        // --- 定时任务 + 合并选项（所有模式下可见） ---
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = isScheduled, onCheckedChange = { isScheduled = it })
+                Text(text = "定时下载", fontSize = 13.sp)
+            }
+            if (isScheduled) {
+                OutlinedButton(
+                    onClick = { showTimePicker = true },
+                    modifier = Modifier.height(32.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
+                ) {
+                    Text(
+                        text = String.format("%02d:%02d", selectedHour, selectedMinute),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = realtimeMerge, onCheckedChange = { realtimeMerge = it })
+                Text(text = if (realtimeMerge) "边下载边合并" else "下载完再合并", fontSize = 13.sp)
+            }
+        }
+
         // 非 Chaturbate 模式才显示标准控件
         if (chaturbateRoomSlug == null) {
             Spacer(modifier = Modifier.height(4.dp))
@@ -268,253 +345,165 @@ fun TaskScreen(
             textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
         )
 
-        // --- Phase 3: 分析分辨率按钮 ---
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Button(
-                onClick = {
-                    if (url.isNotBlank()) {
-                        scope.launch {
-                            isAnalyzingUrl = true
-                            analysisError = null
-                            availableVariants = emptyList()
-                            selectedVariant = null
-
-                            try {
-                                // 根据输入类型选择分析方法
-                                val variants = if (isM3U8Content) {
-                                    if (baseUrlForContent.isNotBlank()) {
-                                        DownloadManager.analyzeUrl(url, baseUrlForContent)
-                                    } else {
-                                        // 尝试从内容自动提取基础 URL
-                                        DownloadManager.analyzeUrl(url, null)
-                                    }
-                                } else {
-                                    DownloadManager.analyzeUrl(url)
-                                }
-
-                                withContext(Dispatchers.Main) {
-                                    availableVariants = variants
-                                    if (variants.isNotEmpty() && autoSelectBest) {
-                                        selectedVariant = variants.first() // 已按带宽降序
-                                        // 提取最佳 URL
-                                        if (isM3U8Content && baseUrlForContent.isNotBlank()) {
-                                            extractedBestUrl = DownloadManager.extractBestStreamUrl(url, baseUrlForContent)
-                                        }
-                                    }
-                                    isAnalyzingUrl = false
-                                }
-                            } catch (e: Exception) {
-                                withContext(Dispatchers.Main) {
-                                    analysisError = "分析失败: ${e.message}"
-                                    isAnalyzingUrl = false
-                                }
-                            }
-                        }
-                    }
-                },
-                enabled = !isAnalyzingUrl && url.isNotBlank() && (!isM3U8Content || baseUrlForContent.isNotBlank())
-            ) {
-                if (isAnalyzingUrl) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("分析中...")
-                } else {
-                    Text(if (isM3U8Content) "解析M3U8内容" else "分析分辨率")
-                }
-            }
-
-            // 自动选择复选框
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(
-                    checked = autoSelectBest,
-                    onCheckedChange = {
-                        autoSelectBest = it
-                        if (it && availableVariants.isNotEmpty()) {
-                            selectedVariant = availableVariants.first()
-                        }
-                    }
-                )
-                Text("自动最高画质", fontSize = 12.sp)
-            }
-        }
-
-        // --- Phase 3: 分辨率选择 Chips ---
-        if (availableVariants.isNotEmpty()) {
-            Column(modifier = Modifier.padding(top = 8.dp)) {
-                Text(
-                    text = "可用分辨率 (${availableVariants.size}个):",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontSize = 11.sp
-                )
-
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    availableVariants.forEach { variant ->
-                        FilterChip(
-                            selected = selectedVariant == variant,
-                            onClick = {
-                                selectedVariant = variant
-                                autoSelectBest = false
-                            },
-                            label = {
-                                Column {
-                                    Text(
-                                        text = variant.resolution?.getShortLabel()
-                                            ?: variant.getResolutionLabel(),
-                                        fontSize = 11.sp
-                                    )
-                                    Text(
-                                        text = variant.getBandwidthLabel(),
-                                        fontSize = 9.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            },
-                            modifier = Modifier.height(36.dp)
-                        )
-                    }
-                }
-            }
-        }
-
-        // 显示分析错误
-        if (analysisError != null) {
-            Text(
-                text = analysisError ?: "",
-                color = MaterialTheme.colorScheme.error,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-        }
-
-        // 显示已选择的分辨率
-        selectedVariant?.let { variant ->
-            Text(
-                text = "已选择: ${variant.resolution?.getShortLabel() ?: variant.getResolutionLabel()} (${variant.getBandwidthLabel()})",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-        }
-
-        // --- 设置选项 ---
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            horizontalArrangement = Arrangement.Start
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = realtimeMerge, onCheckedChange = { realtimeMerge = it })
-                Text(text = if (realtimeMerge) "边下载边合并 (实时)" else "下载完再合并", fontSize = 13.sp)
-            }
-            Spacer(modifier = Modifier.width(16.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = isLive, onCheckedChange = { isLive = it })
-                Text(text = "直播流录制", fontSize = 13.sp)
-            }
-        }
-
-        // 显示提取的最佳流 URL
-        extractedBestUrl?.let { bestUrl ->
-            Text(
-                text = "最佳流: $bestUrl",
-                fontSize = 10.sp,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-        }
-
         // --- 添加任务按钮 ---
         Button(
             onClick = {
                 if (url.isNotBlank() && filename.isNotBlank()) {
-                    // 先保存当前值，再重置状态
                     val currentUrl = url.trim()
                     val currentFilename = filename.trim()
                     val currentIsLive = isLive
                     val currentRealtimeMerge = realtimeMerge
                     val currentDownloadUri = downloadDirectoryUri
-                    val currentIsM3U8Content = isM3U8Content
-                    val currentBaseUrl = baseUrlForContent.trim()
-                    val currentVariant = selectedVariant
-                    val currentExtractedBestUrl = extractedBestUrl
+                    val currentIsScheduled = isScheduled
+                    val currentScheduledHour = selectedHour
+                    val currentScheduledMinute = selectedMinute
 
-                    // 添加日志调试
-                    Log.d("TaskScreen", "添加任务: url='$currentUrl', filename='$currentFilename', isM3U8Content=$currentIsM3U8Content")
-                    Log.d("TaskScreen", "selectedVariant=$currentVariant, extractedBestUrl=$currentExtractedBestUrl")
+                    Log.d("TaskScreen", "添加任务: url='$currentUrl', filename='$currentFilename', isScheduled=$currentIsScheduled")
 
-                    // 重置状态
                     url = ""
                     filename = ""
-                    baseUrlForContent = ""
-                    availableVariants = emptyList()
-                    selectedVariant = null
-                    analysisError = null
-                    extractedBestUrl = null
                     realtimeMerge = true
-                    isLive = false
+                    isLive = true
+                    isScheduled = false
+                    selectedHour = 0
+                    selectedMinute = 0
 
                     scope.launch {
-                        if (!currentIsM3U8Content) {
-                            // URL 模式，使用自动解析
-                            Log.d("TaskScreen", "调用 addTask: url='$currentUrl'")
+                        val scheduledStartTime = if (currentIsScheduled) {
+                            val calendar = Calendar.getInstance()
+                            calendar.set(Calendar.HOUR_OF_DAY, currentScheduledHour)
+                            calendar.set(Calendar.MINUTE, currentScheduledMinute)
+                            calendar.set(Calendar.SECOND, 0)
+                            calendar.set(Calendar.MILLISECOND, 0)
+                            if (calendar.timeInMillis < System.currentTimeMillis()) {
+                                calendar.add(Calendar.DAY_OF_YEAR, 1)
+                            }
+                            calendar.timeInMillis
+                        } else {
+                            0L
+                        }
+
+                        val task = DownloadTask(
+                            id = "task_${System.currentTimeMillis()}",
+                            url = currentUrl,
+                            fileName = currentFilename,
+                            realtimeMerge = currentRealtimeMerge,
+                            isLive = currentIsLive,
+                            customDownloadUri = currentDownloadUri?.toString(),
+                            isScheduled = currentIsScheduled,
+                            scheduledStartTime = scheduledStartTime
+                        )
+
+                        if (currentIsScheduled) {
+                            DownloadManager.addScheduledTask(task)
+                        } else {
                             DownloadManager.addTask(currentUrl, currentFilename, currentRealtimeMerge, currentIsLive, currentDownloadUri)
-                        } else if (currentExtractedBestUrl != null) {
-                            // M3U8 内容模式，使用提取的最佳 URL
-                            Log.d("TaskScreen", "调用 addTask with extractedBestUrl: $currentExtractedBestUrl")
-                            DownloadManager.addTask(currentExtractedBestUrl, currentFilename, currentRealtimeMerge, currentIsLive, currentDownloadUri)
-                        } else if (currentVariant != null) {
-                            // 使用选定的变体
-                            val audioUrl = DownloadManager.getAudioUrlFromContent(currentUrl, currentBaseUrl, currentVariant.audioGroupId)
-                            Log.d("TaskScreen", "调用 addTaskWithVariant: ${currentVariant.uri}")
-                            DownloadManager.addTaskWithVariant(
-                                url = currentVariant.uri,
-                                fileName = currentFilename,
-                                variant = currentVariant,
-                                audioUrl = audioUrl,
-                                realtimeMerge = currentRealtimeMerge,
-                                isLive = currentIsLive,
-                                downloadDirectoryUri = currentDownloadUri
-                            )
                         }
                     }
                 }
             },
             modifier = Modifier.padding(vertical = 8.dp).fillMaxWidth(),
-            enabled = url.isNotBlank() && filename.isNotBlank() && (!isM3U8Content || selectedVariant != null || extractedBestUrl != null)
+            enabled = url.isNotBlank() && filename.isNotBlank()
         ) {
-            Text("添加下载任务")
+            Text(if (isScheduled) "添加定时任务" else "添加下载任务")
         }
 
         } // 结束 if (chaturbateRoomSlug == null)
 
         // --- Chaturbate 连接对话框 ---
         if (showChaturbateDialog && chaturbateRoomSlug != null) {
+            val currentIsScheduled = isScheduled
+            val currentScheduledHour = selectedHour
+            val currentScheduledMinute = selectedMinute
+            val currentDownloadUri = downloadDirectoryUri
+            val currentFilename = filename
+
             ChaturbateConnectDialog(
                 roomSlug = chaturbateRoomSlug,
                 onDismiss = { showChaturbateDialog = false },
                 onStreamUrlObtained = { videoUrl, audioUrl ->
                     showChaturbateDialog = false
-                    Log.d("TaskScreen", "Chaturbate 获取到流地址，开始录制...")
-                    DownloadManager.addTask(
+                    Log.d("TaskScreen", "Chaturbate 获取到流地址，isScheduled=$currentIsScheduled")
+
+                    val scheduledStartTime = if (currentIsScheduled) {
+                        val calendar = Calendar.getInstance()
+                        calendar.set(Calendar.HOUR_OF_DAY, currentScheduledHour)
+                        calendar.set(Calendar.MINUTE, currentScheduledMinute)
+                        calendar.set(Calendar.SECOND, 0)
+                        calendar.set(Calendar.MILLISECOND, 0)
+                        if (calendar.timeInMillis < System.currentTimeMillis()) {
+                            calendar.add(Calendar.DAY_OF_YEAR, 1)
+                        }
+                        calendar.timeInMillis
+                    } else {
+                        0L
+                    }
+
+                    val task = DownloadTask(
+                        id = "task_${System.currentTimeMillis()}",
                         url = videoUrl,
-                        fileName = filename.ifBlank { chaturbateRoomSlug },
+                        fileName = currentFilename.ifBlank { chaturbateRoomSlug },
+                        realtimeMerge = true,
                         isLive = true,
-                        downloadDirectoryUri = downloadDirectoryUri,
-                        audioTrackUrl = audioUrl
+                        customDownloadUri = currentDownloadUri?.toString(),
+                        audioTrackUrl = audioUrl,
+                        isScheduled = currentIsScheduled,
+                        scheduledStartTime = scheduledStartTime
                     )
+
+                    if (currentIsScheduled) {
+                        DownloadManager.addScheduledTask(task)
+                    } else {
+                        DownloadManager.addTask(videoUrl, currentFilename.ifBlank { chaturbateRoomSlug }, true, true, currentDownloadUri)
+                    }
+
                     filename = ""
+                    isScheduled = false
+                    selectedHour = 0
+                    selectedMinute = 0
+                }
+            )
+        }
+
+        // --- 定时时间选择对话框 ---
+        if (showTimePicker) {
+            AlertDialog(
+                onDismissRequest = { showTimePicker = false },
+                title = { Text("选择定时时间") },
+                text = {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(text = "小时:", fontSize = 13.sp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            NumberPicker(
+                                value = selectedHour,
+                                onValueChange = { selectedHour = it.coerceIn(0, 23) },
+                                minValue = 0,
+                                maxValue = 23
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(text = "分钟:", fontSize = 13.sp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            NumberPicker(
+                                value = selectedMinute,
+                                onValueChange = { selectedMinute = it.coerceIn(0, 59) },
+                                minValue = 0,
+                                maxValue = 59
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = { showTimePicker = false }) {
+                        Text("确认")
+                    }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { showTimePicker = false }) {
+                        Text("取消")
+                    }
                 }
             )
         }

@@ -18,6 +18,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dl.m3u8recorder.model.DownloadTask
 import java.text.DecimalFormat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -37,6 +40,13 @@ fun TaskItem(
 
     var showDeleteDialog by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
+
+    val scheduledTimeString = if (task.isScheduled && task.scheduledStartTime > 0) {
+        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+        sdf.format(Date(task.scheduledStartTime))
+    } else {
+        null
+    }
 
     Card(
         modifier = Modifier
@@ -66,6 +76,16 @@ fun TaskItem(
             )
             Spacer(modifier = Modifier.height(4.dp))
 
+            if (task.isScheduled) {
+                Text(
+                    text = "⏰ 定时下载: ${scheduledTimeString ?: "未设置时间"}",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -74,10 +94,20 @@ fun TaskItem(
                 val progressValue = when {
                     currentProgress == 100 -> 1f
                     currentIsCancelled -> 1f
+                    task.isScheduled -> 0f
                     else -> currentProgress / 100f
                 }
 
-                if (currentProgress < 100 && !currentIsCancelled && currentStatusMessage.contains("中")) {
+                if (task.isScheduled) {
+                    LinearProgressIndicator(
+                        progress = { 0f },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(3.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                } else if (currentProgress < 100 && !currentIsCancelled && currentStatusMessage.contains("中")) {
                     LinearProgressIndicator(
                         modifier = Modifier
                             .weight(1f)
@@ -96,7 +126,7 @@ fun TaskItem(
                 }
 
                 Text(
-                    text = "${formatFileSize(downloadedSize)}",
+                    text = if (task.isScheduled) "等待中" else "${formatFileSize(downloadedSize)}",
                     fontSize = 10.sp,
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(start = 8.dp),
@@ -240,8 +270,19 @@ fun TaskItem(
                     val buttonContentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
                     val buttonTextSize = 12.sp
 
-                    // 如果任务正在进行中
-                    if (!currentIsCancelled && currentProgress < 100) {
+                    if (task.isScheduled && !currentIsCancelled) {
+                        OutlinedButton(
+                            onClick = { onCancel(task.id) },
+                            modifier = buttonModifier,
+                            contentPadding = buttonContentPadding
+                        ) { Text("取消定时", fontSize = buttonTextSize) }
+
+                        OutlinedButton(
+                            onClick = { showDeleteDialog = true },
+                            modifier = buttonModifier,
+                            contentPadding = buttonContentPadding
+                        ) { Text("删除", fontSize = buttonTextSize) }
+                    } else if (!currentIsCancelled && currentProgress < 100) {
                         if (task.isLive) {
                             Button(
                                 onClick = { onStopRecording(task.id) },
@@ -257,7 +298,6 @@ fun TaskItem(
                         ) { Text("取消/删除", fontSize = buttonTextSize) }
 
                     } else if (currentIsCancelled || currentProgress == 100) {
-                        // 如果任务已取消或已完成
                         Button(
                             onClick = { onRetry(task.id) },
                             modifier = buttonModifier,

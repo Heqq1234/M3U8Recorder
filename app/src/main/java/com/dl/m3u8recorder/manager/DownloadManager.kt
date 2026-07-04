@@ -29,14 +29,14 @@ import okhttp3.Dispatcher
 object DownloadManager {
     private const val TAG = "DownloadManager"
 
-    // 使用 ConcurrentHashMap 存储任务状态，保证线程安全
     private val currentTasksState = ConcurrentHashMap<String, DownloadTask>()
-    // 存储活跃的 Coroutine Job，用于非直播任务的控制
     private val activeJobs = ConcurrentHashMap<String, Job>()
-    private val downloader = M3U8Downloader() // 用于非直播任务的下载器
+    private val downloader = M3U8Downloader()
 
-    // Phase 2: M3U8 解析器
     private val m3u8Parser = M3U8ParserImpl()
+
+    private val scheduledTasks = ConcurrentHashMap<String, DownloadTask>()
+    private var schedulerJob: Job? = null
 
     // 优化的 OkHttpClient：大连接池 + HTTP/2 + 快速超时
     private val okHttpClient = OkHttpClient.Builder()
@@ -78,18 +78,60 @@ object DownloadManager {
     // 监听器列表，使用 CopyOnWriteArrayList 保证在迭代时修改的线程安全
     private val listeners = CopyOnWriteArrayList<TaskListener>()
 
-    // 初始化 DownloadManager，在 Application 或主 Activity 的 onCreate 中调用
     fun init(context: Context) {
         appContext = context.applicationContext
         if (!::liveStreamRecorder.isInitialized) {
             liveStreamRecorder = LiveStreamRecorder(appContext)
         }
-        // Phase 4: 初始化 LL-HLS 录制器
         if (llhlsRecorder == null) {
             llhlsRecorder = LLHlsRecorder(appContext, okHttpClient)
         }
+        startScheduler()
         Log.d(TAG, "DownloadManager initialized.")
     }
+
+    private fun startScheduler() {
+        schedulerJob?.cancel()
+        schedulerJob = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                val now = System.currentTimeMillis()
+                val tasksToStart = scheduledTasks.filter { it.value.scheduledStartTime <= now }.toList()
+
+                for ((taskId, task) in tasksToStart) {
+                    scheduledTasks.remove(taskId)
+                    startScheduledTask(task)
+                }
+
+                delay(1000)
+            }
+        }
+    }
+
+    private fun startScheduledTask(task: DownloadTask) {
+        Log.d(TAG, "启动定时任务: ${task.id}, fileName: ${task.fileName}")
+        currentTasksState[task.id] = task
+        notifyQueueChanged()
+
+        if (task.isLive) {
+            LiveRecordingService.startService(appContext, task)
+        } else {
+            startDownloadJob(task)
+        }
+    }
+
+    fun addScheduledTask(task: DownloadTask) {
+        scheduledTasks[task.id] = task
+        Log.d(TAG, "添加定时任务: ${task.id}, 开始时间: ${task.scheduledStartTime}, fileName: ${task.fileName}")
+        notifyQueueChanged()
+    }
+
+    fun cancelScheduledTask(taskId: String) {
+        scheduledTasks.remove(taskId)
+        Log.d(TAG, "取消定时任务: $taskId")
+        notifyQueueChanged()
+    }
+
+    fun getScheduledTasks(): List<DownloadTask> = scheduledTasks.values.toList()
 
     // 添加 UI 监听器
     fun addListener(listener: TaskListener) {
@@ -582,26 +624,27 @@ object DownloadManager {
         activeJobs[task.id] = job // 将 Job 存入映射以便后续控制
     }
 
-    /**
-     * 取消指定任务。
-     * 对于直播任务，会通过 LiveRecordingService 停止 FFmpeg。
-     * 对于非直播任务，会取消其协程。
-     * @param taskId 要取消的任务 ID。
-     */
     fun cancelTask(taskId: String) {
+        val scheduledTask = scheduledTasks.remove(taskId)
+        if (scheduledTask != null) {
+            scheduledTask.isCancelled = true
+            scheduledTask.statusMessage = "已取消"
+            notifyTaskUpdated(scheduledTask)
+            Log.d(TAG, "cancelTask: 定时任务 ${taskId} 已取消。")
+            return
+        }
+
         currentTasksState[taskId]?.let { task ->
             if (task.isLive) {
-                LiveRecordingService.stopService(appContext, taskId) // 通过服务停止直播录制
-                // 立即更新 UI 状态，改善响应性
+                LiveRecordingService.stopService(appContext, taskId)
                 task.isCancelled = true
                 task.isPaused = false
                 task.statusMessage = "已取消"
                 notifyTaskUpdated(task)
                 Log.d(TAG, "cancelTask: 请求停止直播任务 ${task.id}。")
             } else {
-                activeJobs[taskId]?.cancel() // 取消非直播任务的协程
-                activeJobs.remove(taskId) // 从活跃 Job 列表中移除
-                // 立即更新 UI 状态
+                activeJobs[taskId]?.cancel()
+                activeJobs.remove(taskId)
                 task.isCancelled = true
                 task.isPaused = false
                 task.statusMessage = "已取消"
@@ -725,13 +768,18 @@ object DownloadManager {
         }
     }
 
-    // 获取当前所有任务的列表
-    fun getTasks(): List<DownloadTask> = currentTasksState.values.toList()
+    fun getTasks(): List<DownloadTask> {
+        val allTasks = mutableListOf<DownloadTask>()
+        allTasks.addAll(scheduledTasks.values)
+        allTasks.addAll(currentTasksState.values)
+        return allTasks.sortedByDescending {
+            if (it.isScheduled) it.scheduledStartTime else System.currentTimeMillis()
+        }
+    }
 
-    // 任务状态监听器接口
     interface TaskListener {
-        fun onTaskUpdated(task: DownloadTask) // 当单个任务状态更新时
-        fun onQueueChanged(tasks: List<DownloadTask>) // 当任务队列（增删）发生变化时
+        fun onTaskUpdated(task: DownloadTask)
+        fun onQueueChanged(tasks: List<DownloadTask>)
     }
 
     /**
