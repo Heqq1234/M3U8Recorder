@@ -25,6 +25,7 @@ class VariantPlaylistTracker(
     companion object {
         private const val TAG = "VariantPlaylistTracker"
         private const val DEFAULT_PART_TARGET = 0.8 // 默认部分片段目标时长
+        private const val MAX_IDLE_MS = 60000 // 最大空闲时间（60秒没有新片段则认为流已结束）
     }
 
     private val parser = M3U8ParserImpl()
@@ -36,6 +37,7 @@ class VariantPlaylistTracker(
     private var currentInitSegment: InitSegment? = null
     private var serverControl: ServerControl? = null
     private var partTarget: Double = DEFAULT_PART_TARGET
+    private var lastSegmentTime: Long = System.currentTimeMillis() // 上次收到新片段的时间
 
     // 创建专门用于阻塞请求的客户端（超时时间更长）
     // 继承原始 client 的 interceptor（包含请求头）
@@ -107,9 +109,16 @@ class VariantPlaylistTracker(
                 if (newSegments.isNotEmpty()) {
                     Log.d(TAG, "发现 ${newSegments.size} 个新完整片段")
                     onNewSegments(newSegments)
+                    lastSegmentTime = System.currentTimeMillis()
                 }
 
                 updateTrackingState(state)
+
+                val idleMs = System.currentTimeMillis() - lastSegmentTime
+                if (idleMs > MAX_IDLE_MS) {
+                    Log.e(TAG, "超过 ${MAX_IDLE_MS / 1000} 秒没有新片段，直播流已结束")
+                    return@withContext
+                }
 
                 if (serverControl?.canBlockReload != true) {
                     val interval = calculateRefreshInterval(state)

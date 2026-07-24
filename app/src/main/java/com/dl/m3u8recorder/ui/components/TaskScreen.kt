@@ -29,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.dl.m3u8recorder.llhls.ChaturbateApi
+import com.dl.m3u8recorder.llhls.StripchatApi
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -104,6 +105,10 @@ fun TaskScreen(
     // Phase 5: Chaturbate 房间模式
     val chaturbateRoomSlug = remember(url) { ChaturbateApi.extractRoomSlug(url) }
     var showChaturbateDialog by remember { mutableStateOf(false) }
+
+    // Stripchat / 白标站点房间模式
+    val stripchatRoomInfo = remember(url) { StripchatApi.extractRoomSlug(url) }
+    var showStripchatDialog by remember { mutableStateOf(false) }
 
     // 定时任务相关状态
     var isScheduled by remember { mutableStateOf(false) }
@@ -284,6 +289,63 @@ fun TaskScreen(
             Spacer(modifier = Modifier.height(4.dp))
         }
 
+        // --- Stripchat 房间模式 ---
+        stripchatRoomInfo?.let { room ->
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                )
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = "Stripchat 房间: ${room.slug}",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        text = "站点: ${room.baseUrl}",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "自动获取直播流地址，支持官方和合作站点",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = filename,
+                            onValueChange = { filename = it },
+                            label = { Text("文件名") },
+                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                if (filename.isNotBlank()) {
+                                    showStripchatDialog = true
+                                }
+                            },
+                            enabled = filename.isNotBlank()
+                        ) {
+                            Text(if (isScheduled) "定时录制" else "连接并录制", fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+
         // --- 保存路径（所有模式下可见） ---
         Column(
             modifier = Modifier
@@ -331,8 +393,8 @@ fun TaskScreen(
             }
         }
 
-        // 非 Chaturbate 模式才显示标准控件
-        if (chaturbateRoomSlug == null) {
+        // 非 Chaturbate/Stripchat 模式才显示标准控件
+        if (chaturbateRoomSlug == null && stripchatRoomInfo == null) {
             Spacer(modifier = Modifier.height(4.dp))
 
             // --- 文件名输入框 ---
@@ -397,7 +459,7 @@ fun TaskScreen(
                         if (currentIsScheduled) {
                             DownloadManager.addScheduledTask(task)
                         } else {
-                            DownloadManager.addTask(currentUrl, currentFilename, currentRealtimeMerge, currentIsLive, currentDownloadUri)
+                            DownloadManager.addTask(currentUrl, currentFilename, currentRealtimeMerge, currentIsLive, currentDownloadUri, audioTrackUrl = null)
                         }
                     }
                 }
@@ -454,7 +516,63 @@ fun TaskScreen(
                     if (currentIsScheduled) {
                         DownloadManager.addScheduledTask(task)
                     } else {
-                        DownloadManager.addTask(videoUrl, currentFilename.ifBlank { chaturbateRoomSlug }, true, true, currentDownloadUri)
+                        DownloadManager.addTask(videoUrl, currentFilename.ifBlank { chaturbateRoomSlug }, true, true, currentDownloadUri, audioTrackUrl = audioUrl)
+                    }
+
+                    filename = ""
+                    isScheduled = false
+                    selectedHour = 0
+                    selectedMinute = 0
+                }
+            )
+        }
+
+        // --- Stripchat 连接对话框 ---
+        if (showStripchatDialog && stripchatRoomInfo != null) {
+            val currentIsScheduled = isScheduled
+            val currentScheduledHour = selectedHour
+            val currentScheduledMinute = selectedMinute
+            val currentDownloadUri = downloadDirectoryUri
+            val currentFilename = filename
+            val currentRoomInfo = stripchatRoomInfo
+
+            StripchatConnectDialog(
+                roomInfo = currentRoomInfo,
+                onDismiss = { showStripchatDialog = false },
+                onStreamUrlObtained = { videoUrl, audioUrl, _ ->
+                    showStripchatDialog = false
+                    Log.d("TaskScreen", "Stripchat 获取到流地址，isScheduled=$currentIsScheduled")
+
+                    val scheduledStartTime = if (currentIsScheduled) {
+                        val calendar = Calendar.getInstance()
+                        calendar.set(Calendar.HOUR_OF_DAY, currentScheduledHour)
+                        calendar.set(Calendar.MINUTE, currentScheduledMinute)
+                        calendar.set(Calendar.SECOND, 0)
+                        calendar.set(Calendar.MILLISECOND, 0)
+                        if (calendar.timeInMillis < System.currentTimeMillis()) {
+                            calendar.add(Calendar.DAY_OF_YEAR, 1)
+                        }
+                        calendar.timeInMillis
+                    } else {
+                        0L
+                    }
+
+                    val task = DownloadTask(
+                        id = "task_${System.currentTimeMillis()}",
+                        url = videoUrl,
+                        fileName = currentFilename.ifBlank { currentRoomInfo.slug },
+                        realtimeMerge = true,
+                        isLive = true,
+                        customDownloadUri = currentDownloadUri?.toString(),
+                        audioTrackUrl = audioUrl,
+                        isScheduled = currentIsScheduled,
+                        scheduledStartTime = scheduledStartTime
+                    )
+
+                    if (currentIsScheduled) {
+                        DownloadManager.addScheduledTask(task)
+                    } else {
+                        DownloadManager.addTask(videoUrl, currentFilename.ifBlank { currentRoomInfo.slug }, true, true, currentDownloadUri, audioTrackUrl = audioUrl)
                     }
 
                     filename = ""

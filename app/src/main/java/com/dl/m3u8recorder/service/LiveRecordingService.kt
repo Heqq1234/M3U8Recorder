@@ -89,16 +89,22 @@ class LiveRecordingService : Service() {
                     intent.getParcelableExtra(EXTRA_DOWNLOAD_TASK)
                 }
                 if (task != null) {
-                    // 如果任务已在活跃列表中，不重复启动
+                    // 如果任务已在活跃列表中，检查是否需要重新启动
                     if (activeLiveRecordingTasks.containsKey(task.id)) {
-                        Log.w(TAG, "任务 ${task.id} 已经在活跃列表中，不重复启动。")
+                        val existingTask = activeLiveRecordingTasks[task.id]
+                        // 如果任务已完成或已取消，允许重新启动
+                        if (existingTask?.progress == 100 || existingTask?.isCancelled == true) {
+                            Log.d(TAG, "任务 ${task.id} 已完成或已取消，重新启动。")
+                            activeLiveRecordingTasks[task.id] = task
+                            startForeground(SERVICE_NOTIFICATION_ID, createSilentNotification())
+                            liveStreamRecorder.startRecording(task)
+                        } else {
+                            Log.w(TAG, "任务 ${task.id} 已经在活跃列表中且正在运行，不重复启动。")
+                        }
                     } else {
-                        // 将新任务添加到活跃列表中
                         activeLiveRecordingTasks[task.id] = task
-                        // 启动前台服务并显示一个不显眼的通知
                         startForeground(SERVICE_NOTIFICATION_ID, createSilentNotification())
-
-                        liveStreamRecorder.startRecording(task) // 启动实际的录制逻辑
+                        liveStreamRecorder.startRecording(task)
                         Log.d(TAG, "启动录制任务: ${task.id}")
                     }
                 } else {

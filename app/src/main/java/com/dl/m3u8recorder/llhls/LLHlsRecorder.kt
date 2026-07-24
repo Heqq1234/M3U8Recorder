@@ -10,9 +10,6 @@ import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * LL-HLS 主录制器
- */
 class LLHlsRecorder(
     private val context: Context,
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
@@ -26,15 +23,11 @@ class LLHlsRecorder(
     private val activeSessions = ConcurrentHashMap<String, RecordingSession>()
     private val globalProgressCounters = ConcurrentHashMap<String, Int>()
     private val partDownloader = PartDownloader(okHttpClient)
-    private val muxer = PipeMuxer()
 
     private data class RecordingSession(
         val taskId: String,
         val task: DownloadTask,
-        val syncCoordinator: SyncCoordinator,
-        val outputFile: File,
-        val videoAppender: CmafAppender?,
-        val audioAppender: CmafAppender?,
+        val realTimeMuxer: RealTimeMuxer,
         val videoTracker: VariantPlaylistTracker?,
         val audioTracker: VariantPlaylistTracker?,
         val videoDeduplicator: FragmentDeduplicator,
@@ -61,21 +54,16 @@ class LLHlsRecorder(
             val audioPlaylistUrl = task.audioTrackUrl
             Log.d(TAG, "URL debug: effectiveUrl=$videoPlaylistUrl audioUrl=$audioPlaylistUrl")
 
-            val outputDir = Mp4OutputHelper.getOutputFile(context, task.fileName, "")
-                .parentFile ?: context.cacheDir
-            val outputFile = File(outputDir, "${task.fileName}.mp4").apply { parentFile?.mkdirs() }
-            val videoFile = File(outputDir, "${task.id}_video.mp4")
-            val audioFile = File(outputDir, "${task.id}_audio.mp4")
+            val outputFile = Mp4OutputHelper.getOutputFile(context, task.fileName, ".mp4")
+            outputFile.parentFile?.mkdirs()
+
+            val realTimeMuxer = RealTimeMuxer(outputFile, task.id)
 
             val videoTracker = VariantPlaylistTracker(okHttpClient)
             val audioTracker = audioPlaylistUrl?.let { VariantPlaylistTracker(okHttpClient) }
 
-            val videoAppender = CmafAppender(videoFile)
-            val audioAppender = audioPlaylistUrl?.let { CmafAppender(audioFile) }
-
             val videoDeduplicator = FragmentDeduplicator()
             val audioDeduplicator = FragmentDeduplicator()
-            val syncCoordinator = SyncCoordinator()
 
             val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -88,26 +76,31 @@ class LLHlsRecorder(
 
             if (videoState.initSegment != null) {
                 onProgress(2, "下载视频初始化片段...")
-                partDownloader.downloadInitSegment(videoState.initSegment.uri)?.let {
-                    videoAppender.writeInitSegment(it)
+                partDownloader.downloadInitSegment(videoState.initSegment.uri)?.let { initData ->
+                    realTimeMuxer.setVideoInitData(initData)
                 }
             }
             if (audioPlaylistUrl != null) {
-                audioTracker?.fetchOnce(audioPlaylistUrl)?.initSegment?.let {
+                val audioState = audioTracker?.fetchOnce(audioPlaylistUrl)
+                if (audioState?.initSegment != null) {
                     onProgress(3, "下载音频初始化片段...")
-                    partDownloader.downloadInitSegment(it.uri)?.let { d ->
-                        audioAppender?.writeInitSegment(d)
+                    val audioInitData = partDownloader.downloadInitSegment(audioState.initSegment.uri)
+                    if (audioInitData != null) {
+                        realTimeMuxer.setAudioInitData(audioInitData)
+                    } else {
+                        realTimeMuxer.setNoAudioTrack()
                     }
+                } else {
+                    realTimeMuxer.setNoAudioTrack()
                 }
+            } else {
+                realTimeMuxer.setNoAudioTrack()
             }
 
             val session = RecordingSession(
                 taskId = task.id,
                 task = task,
-                syncCoordinator = syncCoordinator,
-                outputFile = outputFile,
-                videoAppender = videoAppender,
-                audioAppender = audioAppender,
+                realTimeMuxer = realTimeMuxer,
                 videoTracker = videoTracker,
                 audioTracker = audioTracker,
                 videoDeduplicator = videoDeduplicator,
@@ -126,11 +119,11 @@ class LLHlsRecorder(
                         playlistUrl = videoPlaylistUrl,
                         onInitSegment = {},
                         onNewSegments = { segments ->
-                            appendSegments(segments, videoAppender, videoDeduplicator, session, onProgress)
+                            appendSegments(segments, session, true, onProgress)
                         }
                     )
                 } finally {
-                    session.syncCoordinator.finalize(SyncCoordinator.StreamType.VIDEO)
+                    Log.d(TAG, "Video tracker finished: ${task.id}")
                 }
             }
 
@@ -141,7 +134,7 @@ class LLHlsRecorder(
                             playlistUrl = audioUrl,
                             onInitSegment = {},
                             onNewSegments = { segments ->
-                                appendSegments(segments, audioAppender, audioDeduplicator, session, onProgress)
+                                appendSegments(segments, session, false, onProgress)
                             },
                             isOtherTrackerActive = {
                                 val active = videoJob.isActive
@@ -150,7 +143,6 @@ class LLHlsRecorder(
                             }
                         )
                     } finally {
-                        session.syncCoordinator.finalize(SyncCoordinator.StreamType.AUDIO)
                         Log.d(TAG, "Audio tracker finalized, videoJob.isActive=${videoJob.isActive}")
                     }
                 }
@@ -169,9 +161,6 @@ class LLHlsRecorder(
         }
     }
 
-    /**
-     * 停止录制 → mux 音视频（两遍 mux 修正 PTS）
-     */
     suspend fun stopRecording(taskId: String): File? = withContext(Dispatchers.IO) {
         val session = activeSessions.remove(taskId) ?: return@withContext null
         session.isStopped = true
@@ -179,64 +168,55 @@ class LLHlsRecorder(
         session.audioJob?.let { it.cancel(); it.join() }
         session.scope.cancel()
 
-        session.videoAppender?.flush()
-        session.audioAppender?.flush()
+        session.realTimeMuxer.flush()
+        session.realTimeMuxer.stop()
 
-        val padInfo = session.syncCoordinator.getPadInfo()
-        val startMismatchMs = session.syncCoordinator.getStartMismatchMs()
-        Log.d(TAG, "startMismatchMs=$startMismatchMs padInfo=$padInfo")
-        Log.d(TAG, "SyncCoordinator: ${session.syncCoordinator}")
-        val success = muxer.mux(
-            videoFile = session.videoAppender!!.getOutputFile(),
-            audioFile = session.audioAppender!!.getOutputFile(),
-            outputFile = session.outputFile,
-            padInfo = padInfo,
-            startMismatchMs = startMismatchMs
-        )
+        val outputFile = session.realTimeMuxer.getOutputFile()
 
-        session.videoAppender?.getOutputFile()?.delete()
-        session.audioAppender?.getOutputFile()?.delete()
-        globalProgressCounters.remove(taskId)
-
-        if (success) session.outputFile else null
+        if (outputFile.exists() && outputFile.length() > 0) {
+            Log.d(TAG, "Recording succeeded: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
+            globalProgressCounters.remove(taskId)
+            outputFile
+        } else {
+            Log.e(TAG, "Recording output invalid or missing")
+            globalProgressCounters.remove(taskId)
+            null
+        }
     }
 
-    fun cancelRecording(taskId: String) {
+    suspend fun cancelRecording(taskId: String) {
         val session = activeSessions.remove(taskId) ?: return
         session.isStopped = true
         session.videoJob?.cancel()
         session.audioJob?.cancel()
         session.scope.cancel()
-        session.videoAppender?.flush()
-        session.audioAppender?.flush()
+        session.realTimeMuxer.stop()
         globalProgressCounters.remove(taskId)
     }
 
     private suspend fun appendSegments(
         segments: List<Segment>,
-        appender: CmafAppender?,
-        deduplicator: FragmentDeduplicator,
         session: RecordingSession,
+        isVideo: Boolean,
         onProgress: (Int, String) -> Unit
     ) {
-        if (appender == null || session.isStopped) return
+        if (session.isStopped) return
+
+        val deduplicator = if (isVideo) session.videoDeduplicator else session.audioDeduplicator
         val newSegments = segments.filter { deduplicator.markSegmentDownloaded(it.uri) }
         if (newSegments.isEmpty()) return
 
         partDownloader.downloadParallelOrdered(
-            newSegments.mapIndexed { i, s -> i to s.uri }
+            taskId = session.taskId,
+            parts = newSegments.mapIndexed { i, s -> i to s.uri }
         ) { index, data ->
             if (session.isStopped) return@downloadParallelOrdered
             if (data != null) {
-                appender.appendFragment(data)
-                val seg = newSegments[index]
-                val ms = (seg.duration * 1000).toLong()
-                session.syncCoordinator.addSegment(
-                    if (appender == session.videoAppender) SyncCoordinator.StreamType.VIDEO
-                    else SyncCoordinator.StreamType.AUDIO,
-                    ms,
-                    seg.sequenceNumber
-                )
+                if (isVideo) {
+                    session.realTimeMuxer.addVideoFragment(data)
+                } else {
+                    session.realTimeMuxer.addAudioFragment(data)
+                }
                 val cnt = globalProgressCounters.compute(session.taskId) { _, v -> (v ?: 0) + 1 } ?: 1
                 onProgress((5 + (cnt % 90)), "下载片段 #$cnt")
             }

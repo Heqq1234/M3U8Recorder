@@ -91,16 +91,28 @@ class StreamMuxer {
             return false
         }
 
-        // 检测音视频 PTS 基准偏移（正数 = 音频偏后）
-        val ptsOffsetSec = detectPtsOffset(videoFile, audioFile)
+        var finalVideoFile = videoFile
+        var finalAudioFile = audioFile
 
-        // hasPadInfo 用于 -shortest
-        val hasPadInfo = padInfo != null && padInfo.second <= 30_000L
-        if (padInfo != null && padInfo.second > 30_000L) {
-            Log.w(TAG, "音视频时长差 ${padInfo.second}ms 超过 30s 限制，无法修正")
+        if (padInfo != null) {
+            val (shortType, padMs) = padInfo
+            val padSec = "%.3f".format(padMs / 1000.0)
+            Log.w(TAG, "音视频时长不匹配: ${shortType.name} 短了 ${padMs}ms，将补齐")
+            Log.w(TAG, "补齐短轨: ${shortType.name} 短 ${padMs}ms (${padSec}s)")
+
+            when (shortType) {
+                SyncCoordinator.StreamType.VIDEO -> {
+                    finalVideoFile = padVideoFile(videoFile, padSec)
+                }
+                SyncCoordinator.StreamType.AUDIO -> {
+                    finalAudioFile = padAudioFile(audioFile, padSec)
+                }
+            }
         }
 
-        // 构建命令
+        // 检测音视频 PTS 基准偏移（正数 = 音频偏后）
+        val ptsOffsetSec = detectPtsOffset(finalVideoFile, finalAudioFile)
+
         val args = mutableListOf<String>()
         args.add("-y")
 
@@ -109,17 +121,15 @@ class StreamMuxer {
             Log.w(TAG, "检测到 PTS 偏移: ${"%.3f".format(ptsOffsetSec)}s (音频${if (ptsOffsetSec > 0) "偏后" else "偏前"}，${abs(audioDelayMs)}ms)，"
                     + "补偿: filter_complex + aac reencode")
 
-            args.add("-i"); args.add(videoFile.absolutePath)
-            args.add("-i"); args.add(audioFile.absolutePath)
+            args.add("-i"); args.add(finalVideoFile.absolutePath)
+            args.add("-i"); args.add(finalAudioFile.absolutePath)
 
             if (ptsOffsetSec > 0) {
-                // 音频偏后：asetpts 把音频 PTS 往前移
                 args.add("-filter_complex")
                 args.add("[1:a]asetpts=PTS-${"%.6f".format(ptsOffsetSec)}/TB[aud]")
                 args.add("-map"); args.add("0:v:0")
                 args.add("-map"); args.add("[aud]")
             } else {
-                // 音频偏前：adelay 加静音
                 args.add("-filter_complex")
                 args.add("[1:a]adelay=${-audioDelayMs}|${-audioDelayMs}[aud]")
                 args.add("-map"); args.add("0:v:0")
@@ -129,8 +139,8 @@ class StreamMuxer {
             args.add("-c:v"); args.add("copy")
             args.add("-c:a"); args.add("aac"); args.add("-b:a"); args.add("128k")
         } else {
-            args.add("-i"); args.add(videoFile.absolutePath)
-            args.add("-i"); args.add(audioFile.absolutePath)
+            args.add("-i"); args.add(finalVideoFile.absolutePath)
+            args.add("-i"); args.add(finalAudioFile.absolutePath)
             args.add("-c:v"); args.add("copy")
             args.add("-c:a"); args.add("copy")
             args.add("-map"); args.add("0:v:0")
@@ -143,17 +153,19 @@ class StreamMuxer {
             "-movflags", "+faststart"
         ))
 
-        if (hasPadInfo) {
-            Log.w(TAG, "时长差 ${padInfo!!.second}ms，使用 -shortest 对齐")
-            args.add("-shortest")
-        }
-
         args.add(outputFile.absolutePath)
 
         val command = args.joinToString(" ")
         Log.d(TAG, "Executing mux with timestamp fix: $command")
 
         val session = FFmpegKit.execute(command)
+
+        if (finalVideoFile != videoFile) {
+            finalVideoFile.delete()
+        }
+        if (finalAudioFile != audioFile) {
+            finalAudioFile.delete()
+        }
 
         return if (ReturnCode.isSuccess(session.returnCode)) {
             Log.d(TAG, "Mux with timestamp fix successful: ${outputFile.absolutePath}")

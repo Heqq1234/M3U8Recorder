@@ -14,6 +14,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
 import java.util.TreeMap
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Partial Segment 下载器
@@ -26,11 +27,14 @@ class PartDownloader(
     companion object {
         private const val TAG = "PartDownloader"
         private const val MAX_RETRIES = 3
-        private const val MAX_CONCURRENT_DOWNLOADS = 128  // 全局最大并发：支持多任务同时下载
 
-        // 全局信号量，限制所有任务的并发下载总数
-        private val globalSemaphore = Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        private const val MAX_GLOBAL_CONCURRENT = 24
+        private const val MAX_PER_TASK_CONCURRENT = 6
+
+        private val globalSemaphore = Semaphore(MAX_GLOBAL_CONCURRENT)
     }
+
+    private val taskSemaphores = ConcurrentHashMap<String, Semaphore>()
 
     /**
      * 下载片段数据
@@ -129,44 +133,54 @@ class PartDownloader(
 
     /**
      * 并行下载多个片段
+     * @param taskId 任务 ID，用于每任务并发限制
      * @param uris 片段 URI 列表
      * @return 片段数据列表（与输入顺序对应，失败为 null）
      */
-    suspend fun downloadParallel(uris: List<String>): List<ByteArray?> = coroutineScope {
+    suspend fun downloadParallel(taskId: String, uris: List<String>): List<ByteArray?> = coroutineScope {
+        val taskSemaphore = taskSemaphores.computeIfAbsent(taskId) {
+            Semaphore(MAX_PER_TASK_CONCURRENT)
+        }
         uris.map { uri ->
-            async(Dispatchers.IO) { downloadWithLimit(uri) }
+            async(Dispatchers.IO) {
+                taskSemaphore.withPermit {
+                    globalSemaphore.withPermit {
+                        download(uri)
+                    }
+                }
+            }
         }.awaitAll()
     }
 
     /**
-     * 带并发限制的下载
-     */
-    private suspend fun downloadWithLimit(uri: String): ByteArray? =
-        globalSemaphore.withPermit { download(uri) }
-
-    /**
      * 并行下载多个片段，并按顺序写入（用于需要保证顺序的场景）
+     * @param taskId 任务 ID，用于每任务并发限制
      * @param parts 部分片段列表（带序号）
      * @param onWrite 写入回调，保证顺序
      */
     suspend fun downloadParallelOrdered(
+        taskId: String,
         parts: List<Pair<Int, String>>,
         onWrite: suspend (index: Int, data: ByteArray?) -> Unit
     ) = coroutineScope {
         if (parts.isEmpty()) return@coroutineScope
 
-        // 有序缓冲区：序号 -> 数据
         val buffer = TreeMap<Int, ByteArray?>()
         var nextWriteIndex = 0
         val mutex = Mutex()
+        val taskSemaphore = taskSemaphores.computeIfAbsent(taskId) {
+            Semaphore(MAX_PER_TASK_CONCURRENT)
+        }
 
-        // 并行下载
         parts.map { (index, uri) ->
             async(Dispatchers.IO) {
-                val data = downloadWithLimit(uri)
+                val data = taskSemaphore.withPermit {
+                    globalSemaphore.withPermit {
+                        download(uri)
+                    }
+                }
                 mutex.withLock {
                     buffer[index] = data
-                    // 尝试按顺序写入
                     while (buffer.containsKey(nextWriteIndex)) {
                         val toWrite = buffer.remove(nextWriteIndex)
                         onWrite(nextWriteIndex, toWrite)

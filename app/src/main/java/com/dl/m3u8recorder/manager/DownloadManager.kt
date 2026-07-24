@@ -63,6 +63,12 @@ object DownloadManager {
                 builder.header("Referer", "https://chaturbate.com/")
             }
 
+            // Stripchat / 白标站点 CDN 自动添加 Referer
+            if (url.contains("doppiocdn.com") || url.contains("edge-hls") ||
+                url.contains("stripchat") || url.contains("hotzcam")) {
+                builder.header("Referer", "https://stripchat.com/")
+            }
+
             chain.proceed(builder.build())
         }
         .build()
