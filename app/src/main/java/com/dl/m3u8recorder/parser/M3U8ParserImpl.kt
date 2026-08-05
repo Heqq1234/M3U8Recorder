@@ -180,6 +180,7 @@ class M3U8ParserImpl : M3U8ParserInterface {
         var serverControl: ServerControl? = null
         var currentEncryptionKey: EncryptionKey? = null
         var isDiscontinuity = false
+        var pendingPdtMs: Long? = null  // 待挂载到下一个 segment 的墙钟时间(毫秒)
 
         val lines = content.lines()
 
@@ -190,6 +191,11 @@ class M3U8ParserImpl : M3U8ParserInterface {
 
         var i = 0
         var currentSeq = mediaSequence // 动态序列号计数器
+        // 收集当前 segment 对应的 part，遇到 segment 时统一绑定序号和 PDT
+        val currentSegmentParts = mutableListOf<Part>()
+        var currentPartIndex = 0
+        var partTargetDuration = 0.0
+
         while (i < lines.size) {
             val line = lines[i].trim()
 
@@ -240,15 +246,22 @@ class M3U8ParserImpl : M3U8ParserInterface {
                     }
                 }
 
+                // #EXT-X-PART-INF (LL-HLS)
+                line.startsWith("#EXT-X-PART-INF:") -> {
+                    val attrs = parseAttributes(line.substringAfter(":"))
+                    partTargetDuration = attrs["PART-TARGET"]?.toDoubleOrNull() ?: 0.0
+                }
+
                 // #EXT-X-PART (LL-HLS partial segment)
                 line.startsWith("#EXT-X-PART:") -> {
                     val attrs = parseAttributes(line.substringAfter(":"))
                     val uri = attrs["URI"]?.let { resolveUrl(it, baseUrl) } ?: continue
-                    parts.add(Part(
+                    currentSegmentParts.add(Part(
                         duration = attrs["DURATION"]?.toDoubleOrNull() ?: 0.0,
                         uri = uri,
                         independent = attrs["INDEPENDENT"] == "YES",
-                        gap = attrs["GAP"] == "YES"
+                        gap = attrs["GAP"] == "YES",
+                        partIndex = currentPartIndex++
                     ))
                 }
 
@@ -280,6 +293,11 @@ class M3U8ParserImpl : M3U8ParserInterface {
                     isDiscontinuity = true
                 }
 
+                // #EXT-X-PROGRAM-DATE-TIME (墙钟锚，挂到紧随其后的 segment)
+                line.startsWith("#EXT-X-PROGRAM-DATE-TIME:") -> {
+                    pendingPdtMs = parsePdtToMillis(line.substringAfter(":").trim())
+                }
+
                 // #EXTINF (segment duration + URI)
                 line.startsWith("#EXTINF:") -> {
                     val durationStr = line.substringAfter(":").substringBefore(",")
@@ -290,14 +308,27 @@ class M3U8ParserImpl : M3U8ParserInterface {
 
                     if (nextLine.isNotEmpty() && !nextLine.startsWith("#")) {
                         val uri = resolveUrl(nextLine, baseUrl)
+
+                        // 绑定 part 与当前 segment 的序号和 PDT
+                        currentSegmentParts.forEach { part ->
+                            parts.add(part.copy(
+                                sequenceNumber = currentSeq,
+                                programDateTimeMs = pendingPdtMs
+                            ))
+                        }
+                        currentSegmentParts.clear()
+                        currentPartIndex = 0
+
                         segments.add(Segment(
                             duration = duration,
                             uri = uri,
                             title = title,
                             discontinuity = isDiscontinuity,
                             key = currentEncryptionKey,
-                            sequenceNumber = currentSeq++
+                            sequenceNumber = currentSeq++,
+                            programDateTimeMs = pendingPdtMs
                         ))
+                        pendingPdtMs = null
                         isDiscontinuity = false
                     }
                 }
@@ -307,13 +338,25 @@ class M3U8ParserImpl : M3U8ParserInterface {
                     val uri = resolveUrl(line, baseUrl)
                     // 避免与 #EXTINF 处理重复添加同一 segment（比较已解析的完整 URI）
                     if (segments.isEmpty() || segments.last().uri != uri) {
+                        // 绑定剩余未绑定的 part
+                        currentSegmentParts.forEach { part ->
+                            parts.add(part.copy(
+                                sequenceNumber = currentSeq,
+                                programDateTimeMs = pendingPdtMs
+                            ))
+                        }
+                        currentSegmentParts.clear()
+                        currentPartIndex = 0
+
                         segments.add(Segment(
                             duration = targetDuration,
                             uri = uri,
                             discontinuity = isDiscontinuity,
                             key = currentEncryptionKey,
-                            sequenceNumber = currentSeq++
+                            sequenceNumber = currentSeq++,
+                            programDateTimeMs = pendingPdtMs
                         ))
+                        pendingPdtMs = null
                         isDiscontinuity = false
                     }
                 }
@@ -334,8 +377,41 @@ class M3U8ParserImpl : M3U8ParserInterface {
             initSegment = initSegment,
             parts = parts,
             preloadHints = preloadHints,
-            serverControl = serverControl
+            serverControl = serverControl,
+            partTargetDuration = partTargetDuration
         )
+    }
+
+    /**
+     * 解析 #EXT-X-PROGRAM-DATE-TIME 值为墙钟毫秒时间戳
+     * 支持格式如 "2026-07-24T19:04:11.851+00:00" / "...Z"
+     * 纯手写解析，兼容 API 24+。
+     * 失败返回 null。
+     */
+    private fun parsePdtToMillis(value: String): Long? {
+        return try {
+            val m = Regex("""(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?""")
+                .find(value) ?: return null
+            val (y, mo, d, h, mi, s, frac, tz) = m.destructured
+            val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+            cal.clear()
+            cal.set(y.toInt(), mo.toInt() - 1, d.toInt(), h.toInt(), mi.toInt(), s.toInt())
+            var ms = cal.timeInMillis
+            if (frac.isNotEmpty()) {
+                val padded = (frac + "000000").substring(0, 3)
+                ms += padded.toInt()
+            }
+            if (tz.isNotEmpty() && tz != "Z") {
+                val sign = if (tz[0] == '+') 1 else -1
+                val tzh = tz.substring(1, 3).toInt()
+                val tzm = tz.substring(4, 6).toInt()
+                ms -= sign * (tzh * 3600 + tzm * 60) * 1000L
+            }
+            ms
+        } catch (e: Exception) {
+            Log.w(TAG, "无法解析 PROGRAM-DATE-TIME: $value", e)
+            null
+        }
     }
 
     /**

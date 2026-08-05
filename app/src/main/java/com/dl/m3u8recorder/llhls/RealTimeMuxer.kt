@@ -6,10 +6,14 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.PriorityQueue
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.abs
+import kotlin.math.min
 
 class RealTimeMuxer(
     private val outputFile: File,
@@ -18,6 +22,14 @@ class RealTimeMuxer(
     companion object {
         private const val TAG = "RealTimeMuxer"
         private const val MAX_SAMPLE_QUEUE_SIZE = 2000
+        // 最大允许单轨超前 500ms，防止网络抖动导致时间差越拉越大
+        private const val MAX_LEAD_US = 500_000L
+        // 首帧关键帧最大丢弃帧数，超过则强制以非关键帧起始
+        private const val MAX_DROP_VIDEO_FRAMES = 300
+        // AAC LC 标准 priming 采样数 (48kHz 下约 42.7ms)
+        private const val AAC_PRIMING_SAMPLES = 2048
+        private const val AUDIO_TIMESCALE = 48000
+        private val PRIMING_OFFSET_US = AAC_PRIMING_SAMPLES * 1_000_000L / AUDIO_TIMESCALE // 42666μs ≈ 42.7ms
     }
 
     @Volatile private var mediaMuxer: MediaMuxer? = null
@@ -30,20 +42,49 @@ class RealTimeMuxer(
     @Volatile private var isStarted = false
     @Volatile private var isStopped = false
 
+    // 视频首帧丢弃计数
+    private var droppedVideoFrames = 0
+
     private var videoParser: Fmp4FragmentParser? = null
     private var audioParser: Fmp4FragmentParser? = null
 
-    private data class QueuedSample(
+    /** 公开给外部使用的 sample 数据结构 */
+    data class QueuedSample(
         val pts: Long,
         val data: ByteArray,
         val isKeyFrame: Boolean
     )
 
+    /** 待解析的 fragment，携带它所属 segment 的 PDT（跨轨墙钟对齐用） */
+    private data class PendingFragment(val data: ByteArray, val pdtMs: Long?)
+
     private val videoSampleQueue = PriorityQueue<QueuedSample> { a, b -> a.pts.compareTo(b.pts) }
     private val audioSampleQueue = PriorityQueue<QueuedSample> { a, b -> a.pts.compareTo(b.pts) }
 
-    private val videoFragmentQueue = ConcurrentLinkedQueue<ByteArray>()
-    private val audioFragmentQueue = ConcurrentLinkedQueue<ByteArray>()
+    // 诊断：每条轨首个 sample 的墙钟 PTS 与收到时的墙钟，用于验证跨轨是否对齐
+    @Volatile private var firstVideoPts: Long = Long.MIN_VALUE
+    @Volatile private var firstVideoWallMs: Long = 0
+    @Volatile private var firstAudioPts: Long = Long.MIN_VALUE
+    @Volatile private var firstAudioWallMs: Long = 0
+
+    // 写入 MediaMuxer 时的相对 PTS 基准(微秒)：用两条轨首样墙钟 PTS 的较小值。
+    // 队列里仍存绝对墙钟 PTS 保证跨轨交错正确；写入时减去此 base，让 MediaMuxer
+    // 收到从 0 附近起的相对 PTS（绝对墙钟值如 1.78e15us 会让 MPEG4Writer native write 失败）。
+    @Volatile private var ptsBaseUs: Long = Long.MIN_VALUE
+
+    // 跨轨对齐基准：早于该时间的样本直接丢弃（样本级精确裁剪）
+    @Volatile private var alignPdtUs: Long? = null
+
+    // 首帧关键帧保护：没找到第一个关键帧之前，所有视频帧直接丢弃
+    @Volatile private var hasFoundFirstKeyFrame = false
+    @Volatile private var basePtsUs: Long = Long.MIN_VALUE
+
+    private val videoFragmentQueue = ConcurrentLinkedQueue<PendingFragment>()
+    private val audioFragmentQueue = ConcurrentLinkedQueue<PendingFragment>()
+
+    // Mutex 保护 PriorityQueue 的并发访问
+    private val videoQueueMutex = Mutex()
+    private val audioQueueMutex = Mutex()
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var muxJob: Job? = null
@@ -90,14 +131,29 @@ class RealTimeMuxer(
         checkAndStart()
     }
 
-    fun addVideoFragment(data: ByteArray) {
-        if (isStopped) return
-        videoFragmentQueue.offer(data)
+    private var videoFragmentCount = 0
+    private var audioFragmentCount = 0
+
+    fun addVideoFragment(data: ByteArray, pdtMs: Long? = null) {
+        if (isStopped) {
+            Log.v(TAG, "[$taskId] addVideoFragment ignored: already stopped")
+            return
+        }
+        videoFragmentCount++
+        val cnt = videoFragmentCount
+        Log.v(TAG, "[$taskId] addVideoFragment #$cnt (${data.size} bytes, pdt=$pdtMs), queueSize=${videoFragmentQueue.size + 1}")
+        videoFragmentQueue.offer(PendingFragment(data, pdtMs))
     }
 
-    fun addAudioFragment(data: ByteArray) {
-        if (isStopped) return
-        audioFragmentQueue.offer(data)
+    fun addAudioFragment(data: ByteArray, pdtMs: Long? = null) {
+        if (isStopped) {
+            Log.v(TAG, "[$taskId] addAudioFragment ignored: already stopped")
+            return
+        }
+        audioFragmentCount++
+        val cnt = audioFragmentCount
+        Log.v(TAG, "[$taskId] addAudioFragment #$cnt (${data.size} bytes, pdt=$pdtMs), queueSize=${audioFragmentQueue.size + 1}")
+        audioFragmentQueue.offer(PendingFragment(data, pdtMs))
     }
 
     @Synchronized
@@ -105,13 +161,48 @@ class RealTimeMuxer(
         Log.d(TAG, "[$taskId] Flushing: videoQueue=${videoFragmentQueue.size} audioQueue=${audioFragmentQueue.size} videoSamples=${videoSampleQueue.size} audioSamples=${audioSampleQueue.size}")
     }
 
-    suspend fun stop() {
+    /**
+     * 设置跨轨对齐基准墙钟时间（毫秒）
+     * 早于该时间的样本会被直接丢弃
+     */
+    fun setAlignPoint(alignPdtMs: Long) {
+        this.alignPdtUs = alignPdtMs * 1000L
+        Log.d(TAG, "[$taskId] 对齐基准设置: ${alignPdtMs}ms")
+    }
+
+    suspend fun stop(): Boolean = withContext(Dispatchers.IO) {
         isStopped = true
-        Log.d(TAG, "[$taskId] Stopping, waiting for jobs to complete...")
-        muxJob?.join()
+        Log.w(TAG, "[$taskId] ===== REALTIME MUXER STOP START =====")
+        Log.d(TAG, "[$taskId] Stats before stop: videoFrags=$videoFragmentCount audioFrags=$audioFragmentCount totalWritten=(V=$totalVideoWritten A=$totalAudioWritten)")
+        Log.d(TAG, "[$taskId] Queues before stop: videoFrag=${videoFragmentQueue.size} audioFrag=${audioFragmentQueue.size} videoSample=${videoSampleQueue.size} audioSample=${audioSampleQueue.size}")
+
+        // 1. 等待解析协程把所有待解析分片处理完
+        val parseWaitStart = System.currentTimeMillis()
         parseJob?.join()
+        Log.d(TAG, "[$taskId] Parse job joined, elapsed=${System.currentTimeMillis() - parseWaitStart}ms")
+
+        // 2. 等待复用协程结束（它会处理完所有剩余样本）
+        val muxWaitStart = System.currentTimeMillis()
+        muxJob?.join()
+        Log.d(TAG, "[$taskId] Mux job joined, elapsed=${System.currentTimeMillis() - muxWaitStart}ms")
+
+        // 3. 最后再排空一次（确保没有遗漏）
         drainSampleQueues()
+        val remainingVideo = videoQueueMutex.run { videoSampleQueue.size }
+        val remainingAudio = audioQueueMutex.run { audioSampleQueue.size }
+        if (remainingVideo > 0 || remainingAudio > 0) {
+            Log.w(TAG, "[$taskId] Stop drain: remaining V=$remainingVideo A=$remainingAudio")
+        }
+
+        // 4. 停止并释放 MediaMuxer
         release()
+
+        val finalSize = outputFile.length()
+        Log.w(TAG, "[$taskId] ===== REALTIME MUXER STOP END =====")
+        Log.w(TAG, "[$taskId] Final output: ${outputFile.absolutePath}")
+        Log.w(TAG, "[$taskId] Final size: $finalSize bytes (${finalSize / 1024} KB, ${finalSize / 1024 / 1024} MB)")
+        Log.w(TAG, "[$taskId] Total written: V=$totalVideoWritten A=$totalAudioWritten, droppedPreKeyFrame=$droppedVideoFrames")
+        true
     }
 
     @Synchronized
@@ -126,6 +217,35 @@ class RealTimeMuxer(
             mediaMuxer = null
         } catch (e: Exception) {
             Log.e(TAG, "[$taskId] Failed to release MediaMuxer", e)
+        }
+    }
+
+    // 暴露的入队方法（带Mutex保护）
+    suspend fun addVideoSample(sample: QueuedSample) {
+        videoQueueMutex.withLock {
+            if (videoSampleQueue.size < MAX_SAMPLE_QUEUE_SIZE) {
+                videoSampleQueue.offer(sample)
+            }
+        }
+    }
+
+    suspend fun addAudioSample(sample: QueuedSample) {
+        audioQueueMutex.withLock {
+            if (audioSampleQueue.size < MAX_SAMPLE_QUEUE_SIZE) {
+                audioSampleQueue.offer(sample)
+            }
+        }
+    }
+
+    suspend fun peekVideoSample(): QueuedSample? {
+        return videoQueueMutex.withLock {
+            videoSampleQueue.peek()
+        }
+    }
+
+    suspend fun peekAudioSample(): QueuedSample? {
+        return audioQueueMutex.withLock {
+            audioSampleQueue.peek()
         }
     }
 
@@ -1109,11 +1229,12 @@ class RealTimeMuxer(
     }
 
     private fun startWorkerLoops() {
-        // parseJob: 立即开始解析 fragment → sample
+        // parseJob: 解析 fragment → sample
+        // 停止时继续处理队列中剩余的 fragment，避免尾部数据丢失
         parseJob = scope.launch {
-            while (!isStopped) {
+            while (!isStopped || videoFragmentQueue.isNotEmpty() || audioFragmentQueue.isNotEmpty()) {
                 parseFragments()
-                delay(10)
+                delay(5)
             }
         }
 
@@ -1124,63 +1245,284 @@ class RealTimeMuxer(
             delay(300) // 等 native writer 初始化
             while (!isStopped) {
                 drainSampleQueues()
-                delay(10)
+                delay(5)
             }
-            drainSampleQueues()
+            // 停止后再排空所有剩余样本（循环直到为空或超时）
+            val stopDrainStart = System.currentTimeMillis()
+            var drainCount = 0
+            while (System.currentTimeMillis() - stopDrainStart < 2000) {
+                val vEmpty = videoQueueMutex.run { videoSampleQueue.isEmpty() }
+                val aEmpty = audioQueueMutex.run { audioSampleQueue.isEmpty() }
+                if (vEmpty && aEmpty) break
+                drainSampleQueues()
+                drainCount++
+                delay(5)
+            }
+            Log.d(TAG, "[$taskId] MuxJob final drain: $drainCount rounds")
         }
     }
 
     @Synchronized
     private fun parseFragments() {
         var parsed = 0
+        var videoFragsParsed = 0
+        var audioFragsParsed = 0
 
-        while (videoFragmentQueue.isNotEmpty() && videoSampleQueue.size < MAX_SAMPLE_QUEUE_SIZE) {
-            val data = videoFragmentQueue.poll() ?: break
-            val samples = videoParser?.parseFragment(data) ?: emptyList()
+        // ═══════════════════════════════════════════════════════════════
+        // 视频分片解析：每个分片独立计算墙钟，不依赖全局基准
+        // ═══════════════════════════════════════════════════════════════
+        while (videoFragmentQueue.isNotEmpty()) {
+            val frag = videoFragmentQueue.poll() ?: break
+            videoFragsParsed++
+            val samples = videoParser?.parseFragment(frag.data) ?: emptyList()
+
+            // 获取该分片的独立基准
+            val parser = videoParser
+            val fragmentTfdtTick = parser?.baseMediaDecodeTime ?: 0L
+            val timescale = parser?.trackTimescale ?: 0
+            val fragmentTfdtUs = if (timescale > 0) {
+                fragmentTfdtTick * 1_000_000L / timescale
+            } else fragmentTfdtTick
+            val fragmentPdtMs = frag.pdtMs
+
+            // 日志：每个分片的关键信息
+            if (samples.isNotEmpty()) {
+                Log.d(TAG, "[$taskId] VIDEO fragment parsed: tfdt=${fragmentTfdtTick}tick(${fragmentTfdtUs}us) PDT=${fragmentPdtMs}ms samples=${samples.size} firstPts=${samples.first().pts}us keyFrames=${samples.count { it.isKeyFrame }}")
+            } else {
+                Log.w(TAG, "[$taskId] VIDEO fragment parsed 0 samples! dataSize=${frag.data.size} pdt=$fragmentPdtMs")
+            }
+
+            var droppedByAlign = 0
             for (sample in samples) {
-                videoSampleQueue.offer(QueuedSample(sample.pts, sample.data, sample.isKeyFrame))
+                // 每个分片独立计算墙钟：PDT + (样本PTS - 分片首DTS)
+                val wallPtsUs = if (fragmentPdtMs != null) {
+                    fragmentPdtMs * 1000L + (sample.pts - fragmentTfdtUs)
+                } else {
+                    // 无PDT时退化为相对时间
+                    sample.pts
+                }
+
+                // 对齐裁剪：早于对齐点的样本丢弃
+                val align = alignPdtUs
+                if (align != null && wallPtsUs < align) {
+                    droppedByAlign++
+                    continue
+                }
+
+                // 加锁入队，溢出时丢弃最旧非关键帧
+                videoQueueMutex.run {
+                    if (videoSampleQueue.size >= MAX_SAMPLE_QUEUE_SIZE) {
+                        val iterator = videoSampleQueue.iterator()
+                        while (iterator.hasNext()) {
+                            if (!iterator.next().isKeyFrame) {
+                                iterator.remove()
+                                break
+                            }
+                        }
+                    }
+                    if (videoSampleQueue.size < MAX_SAMPLE_QUEUE_SIZE) {
+                        videoSampleQueue.offer(QueuedSample(wallPtsUs, sample.data, sample.isKeyFrame))
+                    }
+                }
+
+                if (firstVideoPts == Long.MIN_VALUE) {
+                    firstVideoPts = wallPtsUs
+                    firstVideoWallMs = System.currentTimeMillis()
+                    logFirstSample("VIDEO", wallPtsUs, firstVideoWallMs)
+                }
+            }
+            if (droppedByAlign > 0) {
+                Log.d(TAG, "[$taskId] VIDEO fragment dropped $droppedByAlign samples by align (align=${alignPdtUs}us)")
             }
             parsed += samples.size
         }
 
-        while (audioFragmentQueue.isNotEmpty() && audioTrackIndex >= 0 && audioSampleQueue.size < MAX_SAMPLE_QUEUE_SIZE) {
-            val data = audioFragmentQueue.poll() ?: break
-            val samples = audioParser?.parseFragment(data) ?: emptyList()
+        // ═══════════════════════════════════════════════════════════════
+        // 音频分片解析：每个分片独立计算墙钟
+        // AAC Priming 补偿只在音频轨首个分片做一次整体偏移
+        // ═══════════════════════════════════════════════════════════════
+        while (audioFragmentQueue.isNotEmpty() && audioTrackIndex >= 0) {
+            val frag = audioFragmentQueue.poll() ?: break
+            audioFragsParsed++
+            val samples = audioParser?.parseFragment(frag.data) ?: emptyList()
+
+            // 获取该分片的独立基准
+            val aParser = audioParser
+            val fragmentTfdtTick = aParser?.baseMediaDecodeTime ?: 0L
+            val aTimescale = aParser?.trackTimescale ?: 0
+            val fragmentTfdtUs = if (aTimescale > 0) {
+                fragmentTfdtTick * 1_000_000L / aTimescale
+            } else fragmentTfdtTick
+            val fragmentPdtMs = frag.pdtMs
+
+            // 判断是否是音频轨首个分片（用于一次性 Priming 补偿）
+            val isFirstAudioFragment = firstAudioPts == Long.MIN_VALUE
+
+            if (samples.isNotEmpty()) {
+                Log.d(TAG, "[$taskId] AUDIO fragment parsed: tfdt=${fragmentTfdtTick}tick(${fragmentTfdtUs}us) PDT=${fragmentPdtMs}ms samples=${samples.size} firstPts=${samples.first().pts}us firstFragment=$isFirstAudioFragment")
+            } else {
+                Log.w(TAG, "[$taskId] AUDIO fragment parsed 0 samples! dataSize=${frag.data.size} pdt=$fragmentPdtMs")
+            }
+
+            var droppedByAlign = 0
             for (sample in samples) {
-                audioSampleQueue.offer(QueuedSample(sample.pts, sample.data, sample.isKeyFrame))
+                // 每个分片独立计算墙钟
+                var wallPtsUs = if (fragmentPdtMs != null) {
+                    fragmentPdtMs * 1000L + (sample.pts - fragmentTfdtUs)
+                } else {
+                    sample.pts
+                }
+
+                // AAC Priming 补偿：只在音频轨首个分片整体前移
+                // Priming 是编码器初始化时的一次预填充，不是每个分片都有
+                if (isFirstAudioFragment) {
+                    wallPtsUs -= PRIMING_OFFSET_US
+                }
+
+                // 对齐裁剪：早于对齐点的样本丢弃
+                val align = alignPdtUs
+                if (align != null && wallPtsUs < align) {
+                    droppedByAlign++
+                    continue
+                }
+
+                // 加锁入队
+                audioQueueMutex.run {
+                    if (audioSampleQueue.size < MAX_SAMPLE_QUEUE_SIZE) {
+                        audioSampleQueue.offer(QueuedSample(wallPtsUs, sample.data, sample.isKeyFrame))
+                    }
+                }
+
+                if (firstAudioPts == Long.MIN_VALUE) {
+                    firstAudioPts = wallPtsUs
+                    firstAudioWallMs = System.currentTimeMillis()
+                    logFirstSample("AUDIO", wallPtsUs, firstAudioWallMs)
+                }
+            }
+            if (droppedByAlign > 0) {
+                Log.d(TAG, "[$taskId] AUDIO fragment dropped $droppedByAlign samples by align (align=${alignPdtUs}us)")
             }
             parsed += samples.size
         }
 
-        if (parsed > 0) {
-            Log.d(TAG, "[$taskId] Parsed $parsed samples, videoQueue=${videoSampleQueue.size} audioQueue=${audioSampleQueue.size}")
+        if (parsed > 0 || videoFragsParsed > 0 || audioFragsParsed > 0) {
+            Log.d(TAG, "[$taskId] Parse cycle: $parsed samples, videoFrags=$videoFragsParsed audioFrags=$audioFragsParsed, videoQueue=${videoSampleQueue.size} audioQueue=${audioSampleQueue.size}")
+        }
+    }
+
+    /**
+     * 诊断：记录某条轨首个 sample 的墙钟 PTS，并在两条轨都到齐后打印对比。
+     *
+     * 经 PDT 平移后，firstPts 已是墙钟 PTS。两条轨首样墙钟 PTS 差应≈收到墙钟差，
+     * 两者都小且接近 → 跨轨对齐成功；若 PTS 差仍很大 → PDT 平移未生效。
+     */
+    private fun logFirstSample(stream: String, pts: Long, wallMs: Long) {
+        Log.w(TAG, "[$taskId] 首样 $stream: 墙钟PTS=${pts}us (${pts / 1000}ms) wall=$wallMs")
+        if (firstVideoPts != Long.MIN_VALUE && firstAudioPts != Long.MIN_VALUE) {
+            val ptsDiffMs = (firstVideoPts - firstAudioPts) / 1000
+            val wallDiffMs = firstVideoWallMs - firstAudioWallMs
+            Log.w(TAG, "[$taskId] ═══ 首样对比 ═══ video墙钟PTS=${firstVideoPts}us audio墙钟PTS=${firstAudioPts}us " +
+                    "PTS差(视频-音频)=${ptsDiffMs}ms  收到墙钟差(视频-音频)=${wallDiffMs}ms")
+            if (kotlin.math.abs(ptsDiffMs) > 1000) {
+                Log.w(TAG, "[$taskId] ⚠ 两轨首样墙钟 PTS 差 ${ptsDiffMs}ms 仍很大 → PDT 平移可能未生效，" +
+                        "检查 fragment 是否带上了 segment 的 programDateTimeMs")
+            } else {
+                Log.w(TAG, "[$taskId] ✓ 跨轨墙钟 PTS 对齐正常 (差 ${ptsDiffMs}ms)")
+            }
         }
     }
 
     @Synchronized
     private fun drainSampleQueues() {
-        if (!isStarted || mediaMuxer == null) return
+        if (!isStarted || mediaMuxer == null) {
+            if (videoSampleQueue.isNotEmpty() || audioSampleQueue.isNotEmpty()) {
+                Log.v(TAG, "[$taskId] drainSampleQueues skipped: isStarted=$isStarted muxer=${mediaMuxer != null}")
+            }
+            return
+        }
 
         var written = 0
         var dropped = 0
+        var videoWritten = 0
+        var audioWritten = 0
+        val drainStartMs = System.currentTimeMillis()
 
-        while (videoSampleQueue.isNotEmpty() || audioSampleQueue.isNotEmpty()) {
-            val videoSample = videoSampleQueue.peek()
-            val audioSample = audioSampleQueue.peek()
+        while (true) {
+            // 加锁获取队首样本
+            val videoSample = videoQueueMutex.run { videoSampleQueue.peek() }
+            val audioSample = audioQueueMutex.run { audioSampleQueue.peek() }
 
-            val writeVideo = videoSample != null && (audioSample == null || videoSample.pts <= audioSample.pts)
+            // 两队都为空则退出
+            if (videoSample == null && audioSample == null) break
 
-            if (writeVideo) {
-                val sample = videoSampleQueue.poll() ?: continue
-                if (writeSampleToMuxer(videoTrackIndex, sample)) {
+            // ===== 停止保护：如果已停止，且一轨为空另一轨有数据，丢弃尾部 =====
+            // 这是关键修复：直播中断时两轨数据量可能不一致，必须以较短的轨道为准截断，
+            // 否则 MediaMuxer 停止时两轨长度不同，生成的 moov box 损坏，文件黑屏
+            if (isStopped) {
+                if (videoSample == null && audioSample != null) {
+                    // 视频已空，丢弃剩余音频尾部
+                    audioQueueMutex.run { audioSampleQueue.poll() }
+                    dropped++
+                    continue
+                }
+                if (audioSample == null && videoSample != null && audioTrackIndex >= 0) {
+                    // 音频已空（且有音频轨），丢弃剩余视频尾部
+                    videoQueueMutex.run { videoSampleQueue.poll() }
+                    dropped++
+                    continue
+                }
+            }
+
+            // ===== 1. 等待首个视频关键帧 =====
+            if (!hasFoundFirstKeyFrame) {
+                if (videoSample == null) break
+                if (!videoSample.isKeyFrame) {
+                    videoQueueMutex.run { videoSampleQueue.poll() }
+                    droppedVideoFrames++
+                    dropped++
+                    // 兜底：超过最大丢弃帧数后强制起始
+                    if (droppedVideoFrames >= MAX_DROP_VIDEO_FRAMES) {
+                        hasFoundFirstKeyFrame = true
+                        basePtsUs = videoSample.pts
+                        ptsBaseUs = basePtsUs
+                        Log.w(TAG, "[$taskId] No key frame found for $MAX_DROP_VIDEO_FRAMES frames, force start with non-key frame, basePts=$basePtsUs")
+                    }
+                    continue
+                }
+                // 锁定基准时间：以首个视频关键帧的 PTS 为全局基准
+                hasFoundFirstKeyFrame = true
+                basePtsUs = videoSample.pts
+                ptsBaseUs = basePtsUs
+                Log.w(TAG, "[$taskId] Lock first video key frame, base pts=$basePtsUs, droppedPre=$droppedVideoFrames")
+            }
+
+            // ===== 2. 裁剪音频：丢弃早于基准时间的音频 =====
+            if (audioSample != null && audioSample.pts < basePtsUs) {
+                audioQueueMutex.run { audioSampleQueue.poll() }
+                dropped++
+                continue
+            }
+
+            // ===== 3. 跨轨水位保护 + 正常写入：谁PTS小写谁 =====
+            val writeVideo = when {
+                videoSample == null -> false
+                audioSample == null -> true
+                else -> videoSample.pts <= audioSample.pts
+            }
+
+            if (writeVideo && videoSample != null) {
+                videoQueueMutex.run { videoSampleQueue.poll() }
+                if (writeSampleToMuxer(videoTrackIndex, videoSample)) {
                     written++
+                    videoWritten++
                 } else {
                     dropped++
                 }
-            } else if (audioSample != null) {
-                val sample = audioSampleQueue.poll() ?: continue
-                if (writeSampleToMuxer(audioTrackIndex, sample)) {
+            } else if (audioSample != null && audioTrackIndex >= 0) {
+                audioQueueMutex.run { audioSampleQueue.poll() }
+                if (writeSampleToMuxer(audioTrackIndex, audioSample)) {
                     written++
+                    audioWritten++
                 } else {
                     dropped++
                 }
@@ -1189,17 +1531,30 @@ class RealTimeMuxer(
             }
         }
 
+        val elapsed = System.currentTimeMillis() - drainStartMs
         if (written > 0 || dropped > 0) {
-            Log.d(TAG, "[$taskId] Wrote $written samples, dropped $dropped, videoQueue=${videoSampleQueue.size} audioQueue=${audioSampleQueue.size}")
+            Log.d(TAG, "[$taskId] Drain: wrote=$written (V=$videoWritten A=$audioWritten) dropped=$dropped, queues=(V=${videoSampleQueue.size} A=${audioSampleQueue.size}), ${elapsed}ms")
         }
     }
 
     private var muxerReady = false
 
+    private var totalVideoWritten = 0
+    private var totalAudioWritten = 0
+
     private fun writeSampleToMuxer(trackIndex: Int, sample: QueuedSample): Boolean {
         try {
             if (sample.data.size > buffer.capacity()) {
                 Log.w(TAG, "[$taskId] Sample too large: ${sample.data.size} > ${buffer.capacity()}")
+                return false
+            }
+
+            // 写入相对 PTS：墙钟 PTS - ptsBaseUs。两条轨减同一 base，跨轨差值不变（交错仍正确），
+            // 但 MediaMuxer 收到从 0 附近起的值，避免绝对墙钟值导致 native write 失败。
+            val relPts = if (ptsBaseUs != Long.MIN_VALUE) sample.pts - ptsBaseUs else sample.pts
+            if (relPts < 0) {
+                // 早于基准的样本（理论上不应出现，因 base 取最小值），丢弃避免负 PTS
+                Log.w(TAG, "[$taskId] Negative relPts=${relPts}us (wall=${sample.pts} base=${ptsBaseUs}), dropping sample")
                 return false
             }
 
@@ -1210,14 +1565,18 @@ class RealTimeMuxer(
             val info = MediaCodec.BufferInfo().apply {
                 offset = 0
                 size = sample.data.size
-                presentationTimeUs = sample.pts
+                presentationTimeUs = relPts
                 flags = if (sample.isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
             }
 
             mediaMuxer?.writeSampleData(trackIndex, buffer, info)
+
+            val isVideo = trackIndex == videoTrackIndex
+            if (isVideo) totalVideoWritten++ else totalAudioWritten++
+
             if (!muxerReady) {
                 muxerReady = true
-                Log.d(TAG, "[$taskId] First writeSampleData succeeded, muxer is ready")
+                Log.w(TAG, "[$taskId] ===== MUXER READY ===== first write: track=${if (isVideo) "V" else "A"} relPts=${relPts}us key=${sample.isKeyFrame}")
             }
             return true
         } catch (e: IllegalStateException) {

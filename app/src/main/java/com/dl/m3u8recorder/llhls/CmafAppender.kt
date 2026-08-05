@@ -3,6 +3,9 @@ package com.dl.m3u8recorder.llhls
 import android.util.Log
 import java.io.*
 
+// TODO: 已废弃 — 被 RealTimeMuxer 替代。保留代码供参考，后续可删除。
+// LLHlsRecorder 中仍创建实例但功能已被绕过（RealTimeMuxer 路径不依赖文件追加）。
+/*
 /**
  * CMAF/fMP4 片段追加器
  * 用于将 init.mp4 和 m4s fragments 追加成完整的 fragmented MP4
@@ -122,3 +125,4 @@ class CmafAppender(
      */
     fun getOutputFile(): File = outputFile
 }
+*/

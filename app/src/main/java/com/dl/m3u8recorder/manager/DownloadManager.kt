@@ -3,9 +3,13 @@ package com.dl.m3u8recorder.manager
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 import com.dl.m3u8recorder.downloader.M3U8Downloader
+import com.dl.m3u8recorder.llhls.ChaturbateApi
 import com.dl.m3u8recorder.llhls.LLHlsRecorder
+import com.dl.m3u8recorder.llhls.StripchatApi
 import com.dl.m3u8recorder.merger.FFmpegStreamMerger
 import com.dl.m3u8recorder.model.DownloadTask
 import com.dl.m3u8recorder.parser.M3U8ParserImpl
@@ -37,6 +41,8 @@ object DownloadManager {
 
     private val scheduledTasks = ConcurrentHashMap<String, DownloadTask>()
     private var schedulerJob: Job? = null
+    // 定时任务到期后的"重新取流重试"协程，按 taskId 独立(不覆盖 schedulerJob)
+    private val retryJobs = ConcurrentHashMap<String, Job>()
 
     // 优化的 OkHttpClient：大连接池 + HTTP/2 + 快速超时
     private val okHttpClient = OkHttpClient.Builder()
@@ -114,15 +120,121 @@ object DownloadManager {
     }
 
     private fun startScheduledTask(task: DownloadTask) {
-        Log.d(TAG, "启动定时任务: ${task.id}, fileName: ${task.fileName}")
+        Log.d(TAG, "启动定时任务: ${task.id}, fileName: ${task.fileName}, platform: ${task.platform}")
         currentTasksState[task.id] = task
         notifyQueueChanged()
 
-        if (task.isLive) {
+        if (task.platform != null) {
+            // 平台定时任务：到期重新取流(主播可能未开播)，失败每10分钟重试，最多10次
+            startScheduledTaskWithRetry(task)
+        } else if (task.isLive) {
+            // 手动URL直播：直接启动(无重试)
             LiveRecordingService.startService(appContext, task)
         } else {
             startDownloadJob(task)
         }
+    }
+
+    /**
+     * 平台定时任务到期：用房间号重新调平台 API 取流。
+     * 未开播/失败 → 每 10 分钟重试，最多 10 次。全失败 → 任务保留在列表(静默)。
+     * 注：依赖进程存活，App 被杀则重试中断(与定时本身同限制)。
+     */
+    private fun startScheduledTaskWithRetry(task: DownloadTask) {
+        retryJobs[task.id]?.cancel()
+        retryJobs[task.id] = CoroutineScope(Dispatchers.IO).launch {
+            val maxRetries = 10
+            val retryIntervalMs = 10 * 60 * 1000L
+            for (attempt in 1..maxRetries) {
+                if (!isActive) return@launch
+
+                // 1. 调平台 API 取流
+                val fetchResult = when (task.platform) {
+                    "chaturbate" -> {
+                        val slug = task.roomSlug
+                        if (slug.isNullOrBlank()) {
+                            Log.e(TAG, "chaturbate 定时任务缺 roomSlug，放弃")
+                            markRetryExhausted(task, "配置错误：缺少房间号")
+                            return@launch
+                        }
+                        ChaturbateApi.fetchStreamUrl(slug)
+                    }
+                    "stripchat" -> {
+                        val slug = task.roomSlug
+                        val base = task.roomBaseUrl
+                        if (slug.isNullOrBlank() || base.isNullOrBlank()) {
+                            Log.e(TAG, "stripchat 定时任务缺 slug/baseUrl，放弃")
+                            markRetryExhausted(task, "配置错误：缺少房间信息")
+                            return@launch
+                        }
+                        StripchatApi.fetchStreamUrl(StripchatApi.RoomInfo(slug = slug, baseUrl = base))
+                    }
+                    else -> {
+                        Log.e(TAG, "未知 platform: ${task.platform}，放弃")
+                        markRetryExhausted(task, "配置错误：未知平台")
+                        return@launch
+                    }
+                }
+
+                // 2. 取流失败/未开播 → 等待重试
+                if (!fetchResult.isSuccess) {
+                    val msg = fetchResult.errorMessage ?: "未获取到流"
+                    Log.d(TAG, "定时任务 ${task.id} 取流失败($attempt/$maxRetries): $msg")
+                    if (attempt < maxRetries) {
+                        task.statusMessage = "未开播，${retryIntervalMs / 60000}分钟后重试($attempt/$maxRetries)"
+                        task.progress = 0
+                        notifyTaskUpdated(task)
+                        delay(retryIntervalMs)
+                    } else {
+                        markRetryExhausted(task, "多次重试未开播：$msg")
+                    }
+                    continue
+                }
+
+                // 3. 取流成功 → resolveMasterPlaylist 拿 video/audio media URL
+                val resolved = when (task.platform) {
+                    "chaturbate" -> ChaturbateApi.resolveMasterPlaylist(fetchResult.m3u8Url)
+                    "stripchat" -> StripchatApi.resolveMasterPlaylist(fetchResult.m3u8Url, task.roomBaseUrl)
+                    else -> null
+                }
+                if (resolved == null || resolved.videoPlaylistUrl.isBlank()) {
+                    val msg = resolved?.errorMessage ?: "解析播放列表失败"
+                    Log.d(TAG, "定时任务 ${task.id} resolve 失败($attempt/$maxRetries): $msg")
+                    if (attempt < maxRetries) {
+                        task.statusMessage = "解析失败，重试中($attempt/$maxRetries)"
+                        notifyTaskUpdated(task)
+                        delay(retryIntervalMs)
+                    } else {
+                        markRetryExhausted(task, "多次重试解析失败：$msg")
+                    }
+                    continue
+                }
+
+                // 4. 成功：用新 URL 启动录制
+                Log.d(TAG, "定时任务 ${task.id} 取流成功，启动录制: ${resolved.videoPlaylistUrl.take(80)}")
+                // statusMessage 是 body 属性(非构造函数参数)，无法通过 copy() 传入，
+                // copy() 也会丢弃原 task 的运行时状态(_progress 等)，故需显式重置。
+                val liveTask = task.copy(
+                    url = resolved.videoPlaylistUrl,
+                    audioTrackUrl = resolved.audioPlaylistUrl,
+                    isLLHls = true
+                ).apply {
+                    statusMessage = "取流成功，开始录制"
+                }
+                currentTasksState[task.id] = liveTask
+                notifyTaskUpdated(liveTask)
+                LiveRecordingService.startService(appContext, liveTask)
+                return@launch
+            }
+        }
+    }
+
+    /** 重试耗尽：任务保留在列表，标记状态(不删除) */
+    private fun markRetryExhausted(task: DownloadTask, reason: String) {
+        Log.w(TAG, "定时任务 ${task.id} 重试耗尽：$reason，任务保留在列表")
+        task.statusMessage = reason
+        task.progress = 100
+        notifyTaskUpdated(task)
     }
 
     fun addScheduledTask(task: DownloadTask) {
@@ -133,6 +245,7 @@ object DownloadManager {
 
     fun cancelScheduledTask(taskId: String) {
         scheduledTasks.remove(taskId)
+        retryJobs.remove(taskId)?.cancel()  // 取消进行中的取流重试
         Log.d(TAG, "取消定时任务: $taskId")
         notifyQueueChanged()
     }
@@ -346,6 +459,7 @@ object DownloadManager {
      * @param input URL 或 M3U8 内容
      * @param baseUrl 如果输入是 M3U8 内容，需要提供基础 URL 用于解析相对路径
      */
+    @RequiresApi(Build.VERSION_CODES.O)
     suspend fun analyzeUrl(input: String, baseUrl: String? = null): List<VariantStream> = withContext(Dispatchers.IO) {
         try {
             val (content, effectiveBaseUrl) = if (isM3U8Content(input)) {
@@ -415,6 +529,7 @@ object DownloadManager {
      * @param baseUrl 基础 URL（curl 命令中的 URL）
      * @return 最佳流的完整 URL，如果解析失败返回 null
      */
+    @RequiresApi(Build.VERSION_CODES.O)
     fun extractBestStreamUrl(content: String, baseUrl: String): String? {
         return try {
             val cleanContent = extractM3U8Content(content)

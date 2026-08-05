@@ -19,19 +19,19 @@ object ChaturbateApi {
     private const val TAG = "ChaturbateApi"
 
     data class StreamResult(
-        val m3u8Url: String = "",
+        override val m3u8Url: String = "",
         val roomStatus: String? = null,
-        val errorMessage: String? = null
-    ) {
-        val isSuccess: Boolean get() = m3u8Url.isNotBlank()
+        override val errorMessage: String? = null
+    ) : StreamFetchResult {
+        override val isSuccess: Boolean get() = m3u8Url.isNotBlank()
     }
 
     data class ResolvedStream(
-        val videoPlaylistUrl: String = "",
-        val audioPlaylistUrl: String? = null,
-        val errorMessage: String? = null
-    ) {
-        val isSuccess: Boolean get() = videoPlaylistUrl.isNotBlank()
+        override val videoPlaylistUrl: String = "",
+        override val audioPlaylistUrl: String? = null,
+        override val errorMessage: String? = null
+    ) : StreamResolveResult {
+        override val isSuccess: Boolean get() = videoPlaylistUrl.isNotBlank()
     }
 
     val ERROR_MAP = mapOf(
@@ -64,6 +64,8 @@ object ChaturbateApi {
      * 调用 Chaturbate API 获取 m3u8 URL
      */
     suspend fun fetchStreamUrl(roomSlug: String): StreamResult = withContext(Dispatchers.IO) {
+        Log.w(TAG, "══════ Chaturbate 取流开始 ══════")
+        Log.w(TAG, "[1/4] 直播间地址: https://chaturbate.com/$roomSlug/")
         try {
             val client = buildClient()
             val apiUrl = "https://chaturbate.com/get_edge_hls_url_ajax/"
@@ -79,12 +81,13 @@ object ChaturbateApi {
                 .header("Accept-Language", "en-US,en;q=0.9")
                 .build()
 
-            Log.d(TAG, "获取流地址: room=$roomSlug")
+            Log.d(TAG, "[2/4] 请求 API: $apiUrl (room_slug=$roomSlug)")
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: ""
 
             if (!response.isSuccessful) {
                 val isCf = body.contains("cf-browser-verification", ignoreCase = true)
+                Log.e(TAG, "[2/4] API 请求失败: HTTP ${response.code}")
                 return@withContext StreamResult(errorMessage = if (isCf) "Cloudflare 拦截" else "HTTP ${response.code}")
             }
 
@@ -94,16 +97,20 @@ object ChaturbateApi {
 
             when {
                 m3u8Url.isNotBlank() -> {
-                    Log.d(TAG, "成功获取流地址: ${m3u8Url.take(80)}...")
+                    Log.w(TAG, "[3/4] ✓ 获取到 Master M3U8 URL: $m3u8Url")
                     StreamResult(m3u8Url = m3u8Url)
                 }
                 roomStatus.isNotBlank() -> {
+                    Log.w(TAG, "[3/4] ✗ 房间不在直播: $roomStatus")
                     StreamResult(errorMessage = ERROR_MAP[roomStatus] ?: "状态: $roomStatus", roomStatus = roomStatus)
                 }
-                else -> StreamResult(errorMessage = "API 返回空结果")
+                else -> {
+                    Log.e(TAG, "[3/4] ✗ API 返回空结果")
+                    StreamResult(errorMessage = "API 返回空结果")
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "请求失败", e)
+            Log.e(TAG, "[2/4] 请求失败", e)
             StreamResult(errorMessage = "网络错误: ${e.localizedMessage ?: e.message}")
         }
     }
@@ -115,6 +122,8 @@ object ChaturbateApi {
      * LL-HLS 录制器需要直接的 Media Playlist URL。
      */
     suspend fun resolveMasterPlaylist(m3u8Url: String): ResolvedStream = withContext(Dispatchers.IO) {
+        Log.w(TAG, "[4/4] 解析 Master Playlist...")
+        Log.w(TAG, "  ↳ Master M3U8 URL: $m3u8Url")
         try {
             val client = buildClient()
             val request = Request.Builder()
@@ -124,11 +133,11 @@ object ChaturbateApi {
                 .header("Referer", "https://chaturbate.com/")
                 .build()
 
-            Log.d(TAG, "解析 Master Playlist...")
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: return@withContext ResolvedStream(errorMessage = "空响应")
 
             if (!response.isSuccessful) {
+                Log.e(TAG, "  ✗ Master Playlist 下载失败: HTTP ${response.code}")
                 return@withContext ResolvedStream(errorMessage = "HTTP ${response.code}")
             }
 
@@ -147,24 +156,29 @@ object ChaturbateApi {
                 if (line.startsWith("#EXT-X-STREAM-INF:")) {
                     val attrs = parseAttributes(line)
                     val bw = attrs["BANDWIDTH"]?.toIntOrNull() ?: 0
+                    val resolution = attrs["RESOLUTION"] ?: "?"
                     i++
                     val url = lines.getOrNull(i)?.trim() ?: ""
                     val fullUrl = if (url.startsWith("http")) url
                         else if (url.startsWith("/")) "$origin$url"
                         else "$baseUrl/$url"
+                    Log.d(TAG, "  候选变体: ${resolution} ${bw / 1000}kbps -> $fullUrl")
                     if (bw > bestBw) {
                         bestBw = bw
                         videoUrl = fullUrl
                         audioGroupId = attrs["AUDIO"]
+                        Log.d(TAG, "    ★ 当前最佳")
                     }
                 } else if (line.startsWith("#EXT-X-MEDIA:") && line.contains("TYPE=AUDIO")) {
                     val attrs = parseAttributes(line)
                     val uri = attrs["URI"]
                     val gid = attrs["GROUP-ID"]
+                    val lang = attrs["LANGUAGE"] ?: "?"
                     if (uri != null) {
                         val fullUrl = if (uri.startsWith("http")) uri
                             else if (uri.startsWith("/")) "$origin$uri"
                             else "$baseUrl/$uri"
+                        Log.d(TAG, "  音轨: lang=$lang group=$gid -> $fullUrl")
                         if (audioUrl == null && (audioGroupId == null || gid == audioGroupId)) {
                             audioUrl = fullUrl
                         }
@@ -174,13 +188,20 @@ object ChaturbateApi {
             }
 
             if (videoUrl != null) {
-                Log.d(TAG, "Master 解析完成: video=$videoUrl audio=$audioUrl")
+                Log.w(TAG, "══════ Chaturbate 取流完成 ══════")
+                Log.w(TAG, "  ✓ Video Media Playlist: $videoUrl")
+                if (audioUrl != null) {
+                    Log.w(TAG, "  ✓ Audio Media Playlist: $audioUrl")
+                } else {
+                    Log.w(TAG, "  ○ 无独立音频轨")
+                }
                 ResolvedStream(videoPlaylistUrl = videoUrl, audioPlaylistUrl = audioUrl)
             } else {
+                Log.e(TAG, "  ✗ 未找到视频流")
                 ResolvedStream(errorMessage = "未找到视频流")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "解析 Master 失败", e)
+            Log.e(TAG, "  ✗ 解析 Master 失败", e)
             ResolvedStream(errorMessage = "解析失败: ${e.message}")
         }
     }

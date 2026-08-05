@@ -39,11 +39,16 @@ class VariantPlaylistTracker(
     private var partTarget: Double = DEFAULT_PART_TARGET
     private var lastSegmentTime: Long = System.currentTimeMillis() // 上次收到新片段的时间
 
+    // 已打印过结构诊断的 URL（每个 URL 仅首次抓到时打印一次原始内容，避免轮询刷屏）
+    private val diagnosedUrls = java.util.Collections.synchronizedSet(HashSet<String>())
+
     // 创建专门用于阻塞请求的客户端（超时时间更长）
     // 继承原始 client 的 interceptor（包含请求头）
     private val blockingClient: OkHttpClient by lazy {
         client.newBuilder()
             .readTimeout(10, TimeUnit.SECONDS)
+            // 关键：复用原 client 的连接池，避免新建连接
+            .connectionPool(client.connectionPool)
             .build()
     }
 
@@ -74,7 +79,8 @@ class VariantPlaylistTracker(
         onInitSegment: suspend (InitSegment) -> Unit,
         isOtherTrackerActive: () -> Boolean = { false }
     ) = withContext(Dispatchers.IO) {
-        Log.d(TAG, "开始跟踪 LL-HLS 播放列表: $playlistUrl")
+        Log.w(TAG, "══════ VariantPlaylistTracker 启动 ══════")
+        Log.w(TAG, "跟踪 LL-HLS Media Playlist: $playlistUrl")
 
         var consecutiveErrors = 0
         val maxErrors = 10  // 连续 10 次失败则认为流已结束
@@ -107,7 +113,12 @@ class VariantPlaylistTracker(
 
                 val newSegments = detectNewSegments(state)
                 if (newSegments.isNotEmpty()) {
-                    Log.d(TAG, "发现 ${newSegments.size} 个新完整片段")
+                    Log.w(TAG, "发现 ${newSegments.size} 个新完整片段 (mediaSequence=${state.mediaSequence}, segments=${state.segments.size})")
+                    // 打印每个新片段的 URI
+                    newSegments.forEachIndexed { idx, seg ->
+                        Log.d(TAG, "  片段[$idx]: uri=${seg.uri.take(80)} duration=${seg.duration}s " +
+                                "pdt=${seg.programDateTimeMs?.let { java.util.Date(it) } ?: "无"}")
+                    }
                     onNewSegments(newSegments)
                     lastSegmentTime = System.currentTimeMillis()
                 }
@@ -253,6 +264,7 @@ class VariantPlaylistTracker(
 
     /**
      * 获取并解析播放列表
+     * 优化：非阻塞请求使用普通 client（连接复用更好），阻塞请求才用 blockingClient
      */
     private suspend fun fetchAndParse(url: String, depth: Int = 0): PlaylistState = withContext(Dispatchers.IO) {
         // 请求头由 client 的 interceptor 统一设置
@@ -260,7 +272,11 @@ class VariantPlaylistTracker(
             .url(url)
             .build()
 
-        val response = blockingClient.newCall(request).execute()
+        // 判断是否是阻塞请求：URL 带 _HLS_msn 参数
+        val isBlockingRequest = url.contains("_HLS_msn=")
+        // 非阻塞请求用普通 client（连接复用），阻塞请求用 blockingClient（长超时）
+        val httpClient = if (isBlockingRequest) blockingClient else client
+        val response = httpClient.newCall(request).execute()
 
         if (!response.isSuccessful) {
             val errorBody = try { response.body?.string() } catch (_: Exception) { null }
@@ -269,6 +285,11 @@ class VariantPlaylistTracker(
         }
 
         val content = response.body?.string() ?: throw Exception("Empty response")
+
+        // 诊断：每个 URL 首次抓到时打印 playlist 结构，重点确认是否带 #EXT-X-PROGRAM-DATE-TIME
+        if (diagnosedUrls.add(url)) {
+            logPlaylistStructure(url, content)
+        }
 
         // 检测部分片段目标时长
         val partTargetMatch = Regex("""#EXT-X-PART-INF:PART-TARGET=([\d.]+)""").find(content)
@@ -309,6 +330,80 @@ class VariantPlaylistTracker(
     }
 
     /**
+     * 诊断：打印 playlist 结构，重点确认是否带 #EXT-X-PROGRAM-DATE-TIME
+     * 用于决定音视频跨轨对齐走 PDT 还是 EXTINF 时长推算
+     */
+    private fun logPlaylistStructure(url: String, content: String) {
+        val lines = content.lines()
+        val shortUrl = url.substringBefore("?") // 截掉查询参数，避免日志里带 token
+
+        val hasPdt = content.contains("#EXT-X-PROGRAM-DATE-TIME:")
+        val pdtCount = content.split("#EXT-X-PROGRAM-DATE-TIME:").size - 1
+        val hasPartInf = content.contains("#EXT-X-PART-INF")
+        val hasServerControl = content.contains("#EXT-X-SERVER-CONTROL")
+        val hasEndList = content.contains("#EXT-X-ENDLIST")
+        val hasMap = content.contains("#EXT-X-MAP")
+        val mediaSeq = lines.firstOrNull { it.startsWith("#EXT-X-MEDIA-SEQUENCE:") } ?: "(无)"
+        val targetDur = lines.firstOrNull { it.startsWith("#EXT-X-TARGETDURATION:") } ?: "(无)"
+        val partTargetLine = lines.firstOrNull { it.startsWith("#EXT-X-PART-INF:") } ?: "(无)"
+
+        // 提取 init segment URI
+        val initSegMatch = Regex("""#EXT-X-MAP:URI="([^"]+)"""").find(content)
+        val initSegUri = initSegMatch?.groupValues?.get(1)
+
+        Log.w(TAG, "══════ Playlist 结构诊断 ══════")
+        Log.w(TAG, "  URL: $shortUrl")
+        Log.w(TAG, "  类型: ${if (lines.any { it.startsWith("#EXT-X-STREAM-INF:") }) "Master" else "Media"} | " +
+                "LL-HLS=${hasPartInf && hasServerControl} | ENDLIST=$hasEndList")
+        Log.w(TAG, "  $mediaSeq")
+        Log.w(TAG, "  $targetDur")
+        Log.w(TAG, "  $partTargetLine")
+        Log.w(TAG, "  segments=${lines.count { it.startsWith("#EXTINF:") }} | " +
+                "parts=${lines.count { it.startsWith("#EXT-X-PART:") }} | " +
+                "PDT=$hasPdt (${pdtCount}次)")
+
+        if (initSegUri != null) {
+            Log.w(TAG, "  Init Segment: $initSegUri")
+        }
+
+        if (hasPdt) {
+            val pdtSamples = Regex("""#EXT-X-PROGRAM-DATE-TIME:(.+)""")
+                .findAll(content)
+                .take(2)
+                .map { it.groupValues[1].trim() }
+                .toList()
+            Log.w(TAG, "  PDT 样本: $pdtSamples")
+        }
+
+        // 打印所有 segment URI（截断显示）
+        val segUris = lines.filter { !it.startsWith("#") && it.isNotBlank() }
+        if (segUris.isNotEmpty()) {
+            Log.w(TAG, "  Segment URIs (前${kotlin.math.min(segUris.size, 5)}个):")
+            segUris.take(5).forEachIndexed { idx, uri ->
+                Log.w(TAG, "    [$idx] ${uri.take(100)}")
+            }
+            if (segUris.size > 5) {
+                Log.w(TAG, "    ... 共 ${segUris.size} 个")
+            }
+        }
+
+        // 打印所有 part URI
+        val partUris = lines.filter { it.startsWith("#EXT-X-PART:") }
+        if (partUris.isNotEmpty()) {
+            Log.w(TAG, "  Part 片段 (前${kotlin.math.min(partUris.size, 3)}个):")
+            partUris.take(3).forEachIndexed { idx, part ->
+                val uriMatch = Regex("""URI="([^"]+)"""").find(part)
+                Log.w(TAG, "    [$idx] ${uriMatch?.groupValues?.get(1)?.take(100) ?: part.take(80)}")
+            }
+            if (partUris.size > 3) {
+                Log.w(TAG, "    ... 共 ${partUris.size} 个")
+            }
+        }
+
+        Log.w(TAG, "════════════════════════════════")
+    }
+
+    /**
      * 计算刷新间隔
      */
     private fun calculateRefreshInterval(state: PlaylistState): Long {
@@ -335,6 +430,7 @@ class VariantPlaylistTracker(
         lastKnownSegmentCount = 0
         currentInitSegment = null
         serverControl = null
+        diagnosedUrls.clear()
         Log.d(TAG, "VariantPlaylistTracker reset")
     }
 }

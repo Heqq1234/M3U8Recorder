@@ -10,6 +10,9 @@ import java.io.File
 import java.io.RandomAccessFile
 import kotlin.math.abs
 
+// TODO: 已废弃 — 没有任何地方调用。保留代码供参考，后续可删除。
+// 功能被 PipeMuxer 替代（虽然 PipeMuxer 也处于过渡状态，最终目标是 RealTimeMuxer）。
+/*
 /**
  * 音视频流合成器
  * 用于将分离的视频流和音频流合成为最终文件
@@ -494,3 +497,4 @@ class StreamMuxer {
         }
     }
 }
+*/

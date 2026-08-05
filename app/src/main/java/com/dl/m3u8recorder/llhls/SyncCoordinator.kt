@@ -3,6 +3,9 @@ package com.dl.m3u8recorder.llhls
 import android.util.Log
 import java.util.concurrent.ConcurrentHashMap
 
+// TODO: 已废弃 — 没有任何地方实例化使用。保留代码供参考，后续可删除。
+// 功能被 RealTimeMuxer 的样本级时序队列替代。
+/*
 /**
  * 音视频同步协调器
  *
@@ -191,3 +194,4 @@ class SyncCoordinator {
                 "firstVideoSeq=$firstVideoSeq, firstAudioSeq=$firstAudioSeq)"
     }
 }
+*/

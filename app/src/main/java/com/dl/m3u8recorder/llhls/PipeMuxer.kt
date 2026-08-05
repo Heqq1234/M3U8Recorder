@@ -10,6 +10,7 @@ import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
+import kotlin.math.sign
 
 /**
  * 音视频合成器
@@ -29,22 +30,36 @@ class PipeMuxer {
     companion object {
         private const val TAG = "PipeMuxer"
         private const val THRESHOLD_MS = 5
-        private const val ADELAY_THRESHOLD_MS = 1000
+        // PDT 与 tfdt 两信号一致的容差(秒)。|pdtOffset - tfdtOffset| < 此值 → 两信号一致才补偿。
+        // 跨轨差在两轨首 MSN 不同时不可信(各自基准错位)，单信号补偿会把同步流推偏(amwf_poundme 实测)。
+        // 仅当 PDT/tfdt 方向一致、幅度接近时才认为是真偏移、才补偿。
+        private const val SIGNAL_AGREE_SEC = 0.2
+        // 补偿幅度上限(秒)。超过此值视为异常信号，不补偿(避免极端假值推偏)。
+        private const val OFFSET_MAX_SEC = 2.0
+        // AAC Priming 补偿：48kHz 下 2048 采样 ≈ 42.7ms
+        private const val AAC_PRIMING_SAMPLES = 2048
+        private const val AUDIO_SAMPLE_RATE = 48000
+        private val AAC_PRIMING_SEC = AAC_PRIMING_SAMPLES.toDouble() / AUDIO_SAMPLE_RATE
     }
 
     /**
      * @param videoFile 视频原始文件 (CMAF/fMP4 片段拼接)
      * @param audioFile 音频原始文件 (CMAF/fMP4 片段拼接)
      * @param outputFile 输出 MP4
-     * @param padInfo 短轨补齐信息 (哪个轨道短、短多少 ms)
      * @param startMismatchMs 因首分片序列号不一致导致的时长差 (ms)，正=音频起晚了
+     * @param videoFirstPdtMs 视频轨实际下载的首个 segment 的墙钟 PDT(ms)，优先用它做跨轨对齐
+     * @param audioFirstPdtMs 音频轨实际下载的首个 segment 的墙钟 PDT(ms)
+     *
+     * 偏移来源优先级：PDT(墙钟) > tfdt(轨道内)。PDT 是真实墙钟，两轨首段 PDT 差 = 真实起点错位；
+     * tfdt 各轨从 0 起、跨轨不可比，仅作 PDT 缺失时的兜底。
      */
     fun mux(
         videoFile: File,
         audioFile: File?,
         outputFile: File,
-        padInfo: Pair<SyncCoordinator.StreamType, Long>?,
-        startMismatchMs: Long = 0L
+        startMismatchMs: Long = 0L,
+        videoFirstPdtMs: Long? = null,
+        audioFirstPdtMs: Long? = null
     ): Boolean {
         if (!videoFile.exists()) { Log.e(TAG, "video missing"); return false }
         if (audioFile != null && !audioFile.exists()) { Log.e(TAG, "audio missing"); return false }
@@ -53,7 +68,8 @@ class PipeMuxer {
         Log.d(TAG, "Video: ${videoFile.name} (${videoFile.length()} bytes)")
         Log.d(TAG, "Audio: ${audioFile?.name ?: "null"} (${audioFile?.length() ?: 0} bytes)")
         Log.d(TAG, "Output: ${outputFile.name}")
-        Log.d(TAG, "PadInfo: $padInfo, StartMismatch: ${startMismatchMs}ms")
+        Log.d(TAG, "StartMismatch: ${startMismatchMs}ms, " +
+                "videoFirstPdt=${videoFirstPdtMs}ms, audioFirstPdt=${audioFirstPdtMs}ms")
 
         if (audioFile == null) {
             return muxVideoOnly(videoFile, outputFile)
@@ -64,28 +80,83 @@ class PipeMuxer {
             return muxVideoOnly(videoFile, outputFile)
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // 偏移决策：保守不补偿，仅当 PDT 与 tfdt 两信号一致才补偿
+        //
+        // 两轨起点差有两个来源，都不可单信：
+        //   1. playlist 的 PDT（墙钟）—— audio/video 首段常不在同一 MSN，跨 MSN 直接相减无意义；
+        //   2. fMP4 fragment 的 tfdt（baseMediaDecodeTime）—— 同样跨 MSN 时基准错位，差不等于对齐偏移。
+        // 实测教训(amwf_poundme)：原始两轨本同步，单信 tfdt 算出 -1.353s → adelay 填 1.353s 静音 → 把同步流推偏 1.4s。
+        // 故改为：仅当 PDT 与 tfdt 方向一致、幅度接近时才认为是真偏移并补偿，否则纯 -c copy 不补偿。
+        // 最坏情况(真偏移但两信号不一致)不补偿，保留原始状态；优于用假信号把同步流推偏。
+        // ═══════════════════════════════════════════════════════════════════
+
+        val pdtOffsetSec: Double? = if (videoFirstPdtMs != null && audioFirstPdtMs != null) {
+            (audioFirstPdtMs - videoFirstPdtMs) / 1000.0
+        } else null
+
+        if (pdtOffsetSec != null) {
+            val probe = probeStartOffsetOnly(videoFile, audioFile)
+            val tfdtOffsetSec = probe?.first
+
+            // 两信号一致判据：都有值、同号、幅度接近
+            val signalsAgree = tfdtOffsetSec != null &&
+                sign(pdtOffsetSec) == sign(tfdtOffsetSec) &&
+                abs(pdtOffsetSec - tfdtOffsetSec!!) <= SIGNAL_AGREE_SEC
+            val offsetInRange = abs(pdtOffsetSec) <= OFFSET_MAX_SEC
+
+            val trueOffsetSec: Double = when {
+                signalsAgree && offsetInRange -> {
+                    Log.d(TAG, "PDT(${"%.3f".format(pdtOffsetSec)}s) ≈ tfdt(${"%.3f".format(tfdtOffsetSec)}s): " +
+                            "两信号一致, 补偿 ${"%.3f".format(pdtOffsetSec)}s")
+                    pdtOffsetSec
+                }
+                else -> {
+                    Log.d(TAG, "PDT(${"%.3f".format(pdtOffsetSec)}s) vs tfdt(${tfdtOffsetSec?.let { "%.3f".format(it) + "s" } ?: "null"}): " +
+                            "信号不一致${if (!offsetInRange) "(幅度超限)" else ""}, 不补偿(纯 copy)")
+                    0.0
+                }
+            }
+
+            val needsCorrection = abs(trueOffsetSec * 1000) > THRESHOLD_MS
+            val useAdelay = needsCorrection
+            Log.d(TAG, "Offset decision: trueOffset=${"%.3f".format(trueOffsetSec)}s " +
+                    "needsCorrection=$needsCorrection useAdelay=$useAdelay")
+            val cmd = buildCommand(videoFile, audioFile, outputFile, trueOffsetSec, useAdelay, false)
+            Log.d(TAG, "FFmpeg command: $cmd")
+            return executeMux(videoFile, audioFile, outputFile, cmd)
+        }
+
+        // PDT 缺失：走完整漂移检测(含末尾 PTS 探测)，能触发 aresample=async=1 修正累积漂移
         val (startOffset, endOffset, driftDetected) = detectDtsOffsetWithDrift(videoFile, audioFile)
 
-        val trueOffsetSec = if (startOffset != null) {
-            startOffset
-        } else {
-            Log.w(TAG, "DTS offset detection failed, using simple copy mode without correction")
-            0.0
+        val trueOffsetSec = when {
+            startOffset != null -> startOffset
+            else -> {
+                Log.w(TAG, "Offset detection failed (no PDT, no DTS), using simple copy without correction")
+                0.0
+            }
         }
 
         val needsCorrection = abs(trueOffsetSec * 1000) > THRESHOLD_MS
-        val useAdelay = needsCorrection && abs(trueOffsetSec * 1000) > ADELAY_THRESHOLD_MS && !driftDetected
+        // 不设 1000ms 下限；漂移时走 aresample=async=1，互斥不叠加 adelay。
+        val useAdelay = needsCorrection && !driftDetected
 
-        Log.d(TAG, "Offset calc: startOffset=${startOffset?.let { "%.3f".format(it) + "s" } ?: "null"} " +
-                "endOffset=${endOffset?.let { "%.3f".format(it) + "s" } ?: "null"} " +
+        Log.d(TAG, "Offset calc: dtsStartOffset=${startOffset?.let { "%.3f".format(it) + "s" } ?: "null"} " +
+                "dtsEndOffset=${endOffset?.let { "%.3f".format(it) + "s" } ?: "null"} " +
                 "driftDetected=$driftDetected " +
-                "startMismatch=${startMismatchMs}ms " +
                 "trueOffset=${"%.3f".format(trueOffsetSec)}s " +
                 "needsCorrection=$needsCorrection useAdelay=$useAdelay")
 
-        val cmd = buildCommand(videoFile, audioFile, outputFile, trueOffsetSec, padInfo, useAdelay, driftDetected)
+        val cmd = buildCommand(videoFile, audioFile, outputFile, trueOffsetSec, useAdelay, driftDetected)
         Log.d(TAG, "FFmpeg command: $cmd")
+        return executeMux(videoFile, audioFile, outputFile, cmd)
+    }
 
+    /**
+     * 执行 ffmpeg 合并命令 + 音轨检查 + 重试。PDT 短路路径与 DTS 兜底路径共用。
+     */
+    private fun executeMux(videoFile: File, audioFile: File, outputFile: File, cmd: String): Boolean {
         val session = FFmpegKit.execute(cmd)
         var success = ReturnCode.isSuccess(session.returnCode)
         if (success) {
@@ -182,31 +253,35 @@ class PipeMuxer {
         return success
     }
 
-    private fun buildCommand(video: File, audio: File, out: File, offsetSec: Double, padInfo: Pair<SyncCoordinator.StreamType, Long>?, useAdelay: Boolean, driftDetected: Boolean = false): String {
+    private fun buildCommand(video: File, audio: File, out: File, offsetSec: Double, useAdelay: Boolean, driftDetected: Boolean = false): String {
         val args = mutableListOf("-y")
-        val hasPad = padInfo != null
-        val needsAudioPad = hasPad && padInfo?.first == SyncCoordinator.StreamType.AUDIO
-        val needsVideoPad = hasPad && padInfo?.first == SyncCoordinator.StreamType.VIDEO
 
         val audioFilters = mutableListOf<String>()
         val videoFilters = mutableListOf<String>()
-        
+
         if (driftDetected) {
-            audioFilters.add("aresample=async=1")
-            Log.w(TAG, "Using aresample=async=1 for drift correction")
+            audioFilters.add("aresample=async=1000")
+            Log.w(TAG, "Using aresample=async=1000 for drift correction")
         } else if (useAdelay) {
-            val delayMs = (offsetSec * 1000).toInt()
-            audioFilters.add("adelay=${delayMs}|${delayMs}")
-        }
+            // 叠加 AAC priming 补偿（音频固定滞后约42.7ms）
+            val adjustedOffsetSec = offsetSec + AAC_PRIMING_SEC
 
-        if (needsAudioPad) {
-            val padSec = padInfo!!.second / 1000.0
-            audioFilters.add("apad=pad_dur=${"%.3f".format(padSec)}")
-        }
-
-        if (needsVideoPad) {
-            val padSec = padInfo!!.second / 1000.0
-            videoFilters.add("tpad=stop_mode=clone:stop_duration=${"%.3f".format(padSec)}")
+            // adjustedOffsetSec = audioFirstPdt - videoFirstPdt + priming。
+            // adjustedOffsetSec>0: audio 首 PDT 更晚 → audio 内容起点晚于 video → 裁掉 audio 开头 offset 秒，
+            //              使 audio 起点拉到 video 起点墙钟(成片开头 offset 秒只有画面无声，因为那段本就没录到 audio)。
+            // adjustedOffsetSec<0: audio 首 PDT 更早 → audio 内容起点早于 video → adelay 推后 audio |offset| 秒对齐 video。
+            val offsetMs = (adjustedOffsetSec * 1000).toInt()
+            if (offsetMs > 0) {
+                val trimSec = "%.3f".format(adjustedOffsetSec)
+                audioFilters.add("atrim=start=$trimSec,asetpts=PTS-STARTPTS")
+                audioFilters.add("aresample=async=1000")
+                Log.d(TAG, "Audio trim start: ${trimSec}s (audio behind, trim head to align video)")
+            } else {
+                val delayMs = -offsetMs
+                audioFilters.add("adelay=${delayMs}|${delayMs}:all=1")
+                audioFilters.add("aresample=async=1000")
+                Log.d(TAG, "Audio delay: +${delayMs}ms (audio ahead, push back to align video)")
+            }
         }
 
         val needsAudioEncode = audioFilters.isNotEmpty() || driftDetected
@@ -270,6 +345,48 @@ class PipeMuxer {
     // ═══════════════════════════════════════════════════════════════
     // 混合 DTS 探测
     // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * 轻量探测音视频起点 DTS 偏移（仅 start，不含漂移检测）
+     *
+     * 用于 PDT 路径与 tfdt 跨轨差对比：判断 fMP4 的 tfdt 是否已编码真实起点偏移。
+     * 只读文件头(二进制 tfdt) + ffprobe 首 packet 兜底，不做末尾 packet PTS 探测，
+     * 避免长视频 -show_packets 全量输出导致 OOM。
+     *
+     * 优先级: 二进制 tfdt(baseMediaDecodeTime) → ffprobe 首 packet dts_time
+     * @return audioDts - videoDts (秒)；两轨都探测失败返回 null
+     */
+    /**
+     * 轻量探测音视频起点 DTS 偏移（仅 start，不含漂移检测）
+     *
+     * 用于 PDT 路径与 tfdt 跨轨差对比：判断 fMP4 的 tfdt 是否已编码真实起点偏移。
+     * 只读文件头(二进制 tfdt) + ffprobe 首 packet 兜底，不做末尾 packet PTS 探测，
+     * 避免长视频 -show_packets 全量输出导致 OOM。
+     *
+     * 优先级: 二进制 tfdt(baseMediaDecodeTime) → ffprobe 首 packet dts_time
+     * @return Triple(offsetSec, vStartSec, aStartSec)：
+     *         offset = aStart - vStart (audioDts - videoDts, 秒)；
+     *         vStart/aStart 为两轨 tfdt 绝对值(秒)，packet 兜底分支为 null；
+     *         两轨都探测失败返回 null
+     */
+    private fun probeStartOffsetOnly(videoFile: File, audioFile: File): Triple<Double, Double?, Double?>? {
+        val vStart = parseTfdtSeconds(videoFile)
+        val aStart = parseTfdtSeconds(audioFile)
+        if (vStart != null && aStart != null) {
+            val offset = aStart - vStart
+            Log.d(TAG, "probeStartOffsetOnly (tfdt): video=${"%.3f".format(vStart)}s audio=${"%.3f".format(aStart)}s offset=${"%.3f".format(offset)}s")
+            return Triple(offset, vStart, aStart)
+        }
+        val vPkt = probePacketDts(videoFile, "video")
+        val aPkt = probePacketDts(audioFile, "audio")
+        if (vPkt != null && aPkt != null) {
+            val offset = aPkt - vPkt
+            Log.d(TAG, "probeStartOffsetOnly (ffprobe pkt): video=${"%.3f".format(vPkt)}s audio=${"%.3f".format(aPkt)}s offset=${"%.3f".format(offset)}s")
+            return Triple(offset, null, null)
+        }
+        Log.d(TAG, "probeStartOffsetOnly: failed (tfdt=${vStart ?: "v∅"}/${aStart ?: "a∅"}, pkt=${vPkt ?: "v∅"}/${aPkt ?: "a∅"})")
+        return null
+    }
 
     /**
      * 混合探测音视频 DTS 偏移（包含漂移检测）
@@ -499,9 +616,24 @@ class PipeMuxer {
 
     private fun probeLastPacketPts(file: File, codec: String): Double? {
         try {
+            // 只读尾部少量 packet，避免 -show_packets 全量输出导致长视频 OOM。
+            // -read_intervals %-end 只取末尾，但为兼容性先取 duration 再读最后 5 秒。
+            val durCmd = "-v quiet -print_format json -show_entries format=duration -i ${file.absolutePath}"
+            val durSession = FFprobeKit.execute(durCmd)
+            val durJson = JSONObject(durSession.output)
+            val format = durJson.optJSONArray("format")?.optJSONObject(0)
+                ?: durJson.optJSONObject("format")
+            val duration = format?.optDouble("duration", -1.0) ?: -1.0
+            val readInterval = if (duration > 5) {
+                // 读最后 5 秒的 packet
+                "${"%.3f".format(duration - 5)}-end"
+            } else {
+                // 短文件直接全读
+                "%-end"
+            }
             val cmd = "-v quiet -print_format json " +
                     "-select_streams ${if (codec == "video") "v:0" else "a:0"} " +
-                    "-show_packets " +
+                    "-show_packets -read_intervals \"$readInterval\" " +
                     "-i ${file.absolutePath}"
             val session = FFprobeKit.execute(cmd)
             val json = JSONObject(session.output)

@@ -5,6 +5,9 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 
+// TODO: 已废弃 — 没有任何地方实例化使用。保留代码供参考，后续可删除。
+// 功能被 RealTimeMuxer 的样本级时序队列替代。
+/*
 class SegmentSynchronizer(
     private val videoAppender: CmafAppender,
     private val audioAppender: CmafAppender?,
@@ -254,3 +257,4 @@ class SegmentSynchronizer(
         return String(bytes, offset, 4, Charsets.US_ASCII)
     }
 }
+*/

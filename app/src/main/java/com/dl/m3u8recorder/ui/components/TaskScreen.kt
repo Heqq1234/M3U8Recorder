@@ -453,7 +453,10 @@ fun TaskScreen(
                             isLive = currentIsLive,
                             customDownloadUri = currentDownloadUri?.toString(),
                             isScheduled = currentIsScheduled,
-                            scheduledStartTime = scheduledStartTime
+                            scheduledStartTime = scheduledStartTime,
+                            // 直播流必须走 LL-HLS 录制器(OkHttp 处理 https)，否则 ffmpeg 直录分支因
+                            // 未启用 openssl 无法处理 https URL → Protocol not found 失败
+                            isLLHls = currentIsLive
                         )
 
                         if (currentIsScheduled) {
@@ -510,7 +513,12 @@ fun TaskScreen(
                         customDownloadUri = currentDownloadUri?.toString(),
                         audioTrackUrl = audioUrl,
                         isScheduled = currentIsScheduled,
-                        scheduledStartTime = scheduledStartTime
+                        scheduledStartTime = scheduledStartTime,
+                        // 直播流走 LL-HLS 录制器(OkHttp https)，避免 ffmpeg 直录分支 https 失败
+                        isLLHls = true,
+                        // 定时任务存平台+房间号，到期可重新取流(主播未开播重试)
+                        platform = "chaturbate",
+                        roomSlug = chaturbateRoomSlug
                     )
 
                     if (currentIsScheduled) {
@@ -566,7 +574,13 @@ fun TaskScreen(
                         customDownloadUri = currentDownloadUri?.toString(),
                         audioTrackUrl = audioUrl,
                         isScheduled = currentIsScheduled,
-                        scheduledStartTime = scheduledStartTime
+                        scheduledStartTime = scheduledStartTime,
+                        // 直播流走 LL-HLS 录制器(OkHttp https)，避免 ffmpeg 直录分支 https 失败
+                        isLLHls = true,
+                        // 定时任务存平台+房间号，到期可重新取流(主播未开播重试)
+                        platform = "stripchat",
+                        roomSlug = currentRoomInfo.slug,
+                        roomBaseUrl = currentRoomInfo.baseUrl
                     )
 
                     if (currentIsScheduled) {

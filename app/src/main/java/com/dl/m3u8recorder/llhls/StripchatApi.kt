@@ -35,19 +35,19 @@ object StripchatApi {
     )
 
     data class StreamResult(
-        val m3u8Url: String = "",
+        override val m3u8Url: String = "",
         val roomStatus: String? = null,
-        val errorMessage: String? = null
-    ) {
-        val isSuccess: Boolean get() = m3u8Url.isNotBlank()
+        override val errorMessage: String? = null
+    ) : StreamFetchResult {
+        override val isSuccess: Boolean get() = m3u8Url.isNotBlank()
     }
 
     data class ResolvedStream(
-        val videoPlaylistUrl: String = "",
-        val audioPlaylistUrl: String? = null,
-        val errorMessage: String? = null
-    ) {
-        val isSuccess: Boolean get() = videoPlaylistUrl.isNotBlank()
+        override val videoPlaylistUrl: String = "",
+        override val audioPlaylistUrl: String? = null,
+        override val errorMessage: String? = null
+    ) : StreamResolveResult {
+        override val isSuccess: Boolean get() = videoPlaylistUrl.isNotBlank()
     }
 
     // Stripchat 官方域名模式
@@ -176,13 +176,15 @@ object StripchatApi {
      * @return StreamResult 包含 Master M3U8 URL
      */
     suspend fun fetchStreamUrl(roomInfo: RoomInfo): StreamResult = withContext(Dispatchers.IO) {
+        Log.w(TAG, "══════ Stripchat 取流开始 ══════")
+        Log.w(TAG, "[1/4] 直播间地址: ${roomInfo.baseUrl}/${roomInfo.slug}")
         try {
             val pageUrl = "${roomInfo.baseUrl}/${roomInfo.slug}"
             val host = roomInfo.baseUrl.substringAfter("://")
 
             val client = buildClient(host)
 
-            Log.d(TAG, "请求页面: $pageUrl")
+            Log.d(TAG, "[2/4] 请求页面: $pageUrl")
             val request = Request.Builder()
                 .url(pageUrl)
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -195,7 +197,7 @@ object StripchatApi {
             val html = response.body?.string() ?: ""
 
             if (!response.isSuccessful) {
-                Log.e(TAG, "HTTP ${response.code}: ${html.take(200)}")
+                Log.e(TAG, "[2/4] HTTP ${response.code}: ${html.take(200)}")
                 val isCf = html.contains("cf-browser-verification", ignoreCase = true)
                     || html.contains("captcha", ignoreCase = true)
                 return@withContext StreamResult(
@@ -203,39 +205,42 @@ object StripchatApi {
                 )
             }
 
-            Log.d(TAG, "页面获取成功，长度: ${html.length}")
+            Log.d(TAG, "[2/4] 页面获取成功，长度: ${html.length}")
 
             // 提取 window.__PRELOADED_STATE__
             val preloadedJson = extractPreloadedState(html)
             if (preloadedJson == null) {
-                Log.e(TAG, "未找到 __PRELOADED_STATE__")
+                Log.e(TAG, "[2/4] ✗ 未找到 __PRELOADED_STATE__")
                 return@withContext StreamResult(errorMessage = "无法解析页面数据（未找到预加载状态）")
             }
 
-            Log.d(TAG, "提取到 __PRELOADED_STATE__，长度: ${preloadedJson.length}")
+            Log.d(TAG, "[2/4] 提取到 __PRELOADED_STATE__，长度: ${preloadedJson.length}")
 
             // 解析 JSON
             val data = JSONObject(preloadedJson)
             val viewCam = data.optJSONObject("viewCam")
             if (viewCam == null) {
-                Log.e(TAG, "viewCam 字段不存在")
+                Log.e(TAG, "[2/4] ✗ viewCam 字段不存在")
                 return@withContext StreamResult(errorMessage = "页面数据格式异常（缺少 viewCam）")
             }
 
             // 检查私密秀
             if (viewCam.has("show") && !viewCam.isNull("show")) {
+                Log.w(TAG, "[2/4] ✗ 房间正在进行私密秀")
                 return@withContext StreamResult(errorMessage = "房间正在进行私密秀")
             }
 
             // 检查直播状态
             val model = viewCam.optJSONObject("model")
             if (model == null) {
+                Log.e(TAG, "[2/4] ✗ 无法获取主播信息")
                 return@withContext StreamResult(errorMessage = "无法获取主播信息")
             }
 
             val isLive = model.optBoolean("isLive", false)
             if (!isLive) {
                 val status = model.optString("status", "offline")
+                Log.w(TAG, "[2/4] ✗ 房间不在直播: $status")
                 return@withContext StreamResult(
                     errorMessage = when (status) {
                         "offline" -> "房间当前不在直播"
@@ -252,6 +257,7 @@ object StripchatApi {
             if (modelId == 0L) {
                 val modelIdInt = model.optInt("id", 0)
                 if (modelIdInt == 0) {
+                    Log.e(TAG, "[2/4] ✗ 无法获取主播 ID")
                     return@withContext StreamResult(errorMessage = "无法获取主播 ID")
                 }
                 return@withContext buildM3u8Url(data, modelIdInt.toLong(), roomInfo)
@@ -259,7 +265,7 @@ object StripchatApi {
 
             return@withContext buildM3u8Url(data, modelId, roomInfo)
         } catch (e: Exception) {
-            Log.e(TAG, "请求失败", e)
+            Log.e(TAG, "[2/4] ✗ 请求失败", e)
             StreamResult(errorMessage = "网络错误: ${e.localizedMessage ?: e.message}")
         }
     }
@@ -268,19 +274,20 @@ object StripchatApi {
      * 从 __PRELOADED_STATE__ 中提取 HLS 服务器地址并拼接 m3u8 URL
      */
     private fun buildM3u8Url(data: JSONObject, modelId: Long, roomInfo: RoomInfo): StreamResult {
+        Log.w(TAG, "[3/4] 构建 Master M3U8 URL...")
         // 按优先级查找 HLS 服务器地址
         val hlsHost = findHlsHost(data)
         if (hlsHost == null) {
-            Log.e(TAG, "未找到 HLS 服务器地址")
+            Log.e(TAG, "[3/4] ✗ 未找到 HLS 服务器地址")
             return StreamResult(errorMessage = "无法获取流媒体服务器地址")
         }
 
-        Log.d(TAG, "modelId=$modelId, hlsHost=$hlsHost")
+        Log.d(TAG, "[3/4] modelId=$modelId, hlsHost=$hlsHost")
 
         // 拼接 m3u8 URL
         // 格式: https://edge-hls.{host}/hls/{model_id}/master/{model_id}_auto.m3u8
         val m3u8Url = "https://edge-hls.$hlsHost/hls/$modelId/master/$modelId" + "_auto.m3u8"
-        Log.d(TAG, "成功构建流地址: ${m3u8Url.take(100)}...")
+        Log.w(TAG, "[3/4] ✓ Master M3U8 URL: $m3u8Url")
 
         return StreamResult(m3u8Url = m3u8Url)
     }
@@ -428,6 +435,8 @@ object StripchatApi {
      */
     suspend fun resolveMasterPlaylist(m3u8Url: String, refererDomain: String? = null): ResolvedStream =
         withContext(Dispatchers.IO) {
+            Log.w(TAG, "[4/4] 解析 Master Playlist...")
+            Log.w(TAG, "  ↳ Master M3U8 URL: $m3u8Url")
             try {
                 val host = m3u8Url.substringAfter("://").substringBefore("/")
                 val client = buildClient(host)
@@ -445,12 +454,13 @@ object StripchatApi {
                     .header("Referer", referer)
                     .build()
 
-                Log.d(TAG, "解析 Master Playlist: $m3u8Url (referer=$referer)")
+                Log.d(TAG, "  请求 Master Playlist (referer=$referer)")
                 val response = client.newCall(request).execute()
                 val body = response.body?.string()
                     ?: return@withContext ResolvedStream(errorMessage = "空响应")
 
                 if (!response.isSuccessful) {
+                    Log.e(TAG, "  ✗ Master Playlist 下载失败: HTTP ${response.code}")
                     return@withContext ResolvedStream(errorMessage = "HTTP ${response.code}")
                 }
 
@@ -475,24 +485,25 @@ object StripchatApi {
                         val url = lines.getOrNull(i)?.trim() ?: ""
                         val fullUrl = resolveUrl(url, origin, baseUrl)
 
+                        Log.d(TAG, "  候选变体: ${resolution ?: "?"} ${bw / 1000}kbps -> $fullUrl")
                         // 选最高带宽
                         if (bw > bestBw) {
                             bestBw = bw
                             videoUrl = fullUrl
                             audioGroupId = attrs["AUDIO"]
-                            Log.d(TAG, "候选流: ${resolution ?: "?"} ${bw / 1000}kbps -> $fullUrl")
+                            Log.d(TAG, "    ★ 当前最佳")
                         }
                     } else if (line.startsWith("#EXT-X-MEDIA:") && line.contains("TYPE=AUDIO")) {
                         val attrs = parseAttributes(line)
                         val uri = attrs["URI"]
                         val gid = attrs["GROUP-ID"]
-                        val language = attrs["LANGUAGE"]
+                        val language = attrs["LANGUAGE"] ?: "?"
                         if (uri != null) {
                             val fullUrl = resolveUrl(uri, origin, baseUrl)
+                            Log.d(TAG, "  音轨: lang=$language group=$gid -> $fullUrl")
                             // 优先匹配与视频流相同的 GROUP-ID，否则选第一个
                             if (audioUrl == null || (audioGroupId != null && gid == audioGroupId)) {
                                 audioUrl = fullUrl
-                                Log.d(TAG, "音轨: ${language ?: "?"} group=$gid -> $fullUrl")
                             }
                         }
                     }
@@ -500,13 +511,20 @@ object StripchatApi {
                 }
 
                 if (videoUrl != null) {
-                    Log.d(TAG, "Master 解析完成: video=$videoUrl audio=$audioUrl")
+                    Log.w(TAG, "══════ Stripchat 取流完成 ══════")
+                    Log.w(TAG, "  ✓ Video Media Playlist: $videoUrl")
+                    if (audioUrl != null) {
+                        Log.w(TAG, "  ✓ Audio Media Playlist: $audioUrl")
+                    } else {
+                        Log.w(TAG, "  ○ 无独立音频轨")
+                    }
                     ResolvedStream(videoPlaylistUrl = videoUrl, audioPlaylistUrl = audioUrl)
                 } else {
+                    Log.e(TAG, "  ✗ 未找到视频流")
                     ResolvedStream(errorMessage = "未找到视频流")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "解析 Master 失败", e)
+                Log.e(TAG, "  ✗ 解析 Master 失败", e)
                 ResolvedStream(errorMessage = "解析失败: ${e.message}")
             }
         }

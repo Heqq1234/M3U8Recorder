@@ -3,6 +3,8 @@ package com.dl.m3u8recorder.llhls
 import android.util.Log
 import java.util.concurrent.ConcurrentHashMap
 
+// TODO: 已废弃 — 功能简单，可内联到 LLHlsRecorder。保留代码供参考，后续可删除。
+/*
 /**
  * Fragment 去重器
  * LL-HLS Playlist 会重复返回旧的 fragments，需要去重避免视频损坏
@@ -110,3 +112,4 @@ class FragmentDeduplicator {
         }
     }
 }
+*/

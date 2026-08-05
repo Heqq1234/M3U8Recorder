@@ -58,7 +58,12 @@ data class DownloadTask(
 
     val isScheduled: Boolean = false,
 
-    val scheduledStartTime: Long = 0L
+    val scheduledStartTime: Long = 0L,
+
+    // 定时任务到期重新取流用(主播未开播重试)。手动URL分支不填。
+    val platform: String? = null,       // "chaturbate" | "stripchat" | null
+    val roomSlug: String? = null,       // 房间 slug
+    val roomBaseUrl: String? = null     // stripchat 的 baseUrl(chaturbate 不用)
 
 ) : Parcelable {
 

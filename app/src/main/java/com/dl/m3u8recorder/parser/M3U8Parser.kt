@@ -32,7 +32,8 @@ sealed class M3U8Playlist {
         val initSegment: InitSegment?,       // EXT-X-MAP (CMAF/fMP4)
         val parts: List<Part>,               // EXT-X-PART (LL-HLS)
         val preloadHints: List<PreloadHint>, // EXT-X-PRELOAD-HINT
-        val serverControl: ServerControl?    // EXT-X-SERVER-CONTROL
+        val serverControl: ServerControl?,   // EXT-X-SERVER-CONTROL
+        val partTargetDuration: Double = 0.0 // LL-HLS PART-TARGET
     ) : M3U8Playlist()
 }
 
@@ -138,7 +139,8 @@ data class Segment(
     val discontinuity: Boolean = false, // 是否有不连续标记
     val key: EncryptionKey? = null,   // 加密密钥
     val mapUri: String? = null,       // 该片段专用的 init segment
-    val sequenceNumber: Long = 0L     // 分片序列号 (基于 #EXT-X-MEDIA-SEQUENCE)
+    val sequenceNumber: Long = 0L,    // 分片序列号 (基于 #EXT-X-MEDIA-SEQUENCE)
+    val programDateTimeMs: Long? = null  // 来自 #EXT-X-PROGRAM-DATE-TIME 的墙钟(毫秒)，跨轨对齐用
 )
 
 /**
@@ -156,7 +158,10 @@ data class Part(
     val duration: Double,             // 时长 (秒)
     val uri: String,                  // 部分 URL
     val independent: Boolean = false, // 是否可独立解码
-    val gap: Boolean = false          // 是否有间隙
+    val gap: Boolean = false,         // 是否有间隙
+    val sequenceNumber: Long = 0L,    // 所属完整分片的序号
+    val partIndex: Int = 0,           // 在分片中的序号
+    val programDateTimeMs: Long? = null // 继承自所属分片的墙钟时间
 )
 
 /**
