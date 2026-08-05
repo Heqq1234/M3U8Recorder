@@ -10,7 +10,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.nio.ByteBuffer
-import java.util.PriorityQueue
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.abs
 import kotlin.math.min
@@ -48,6 +47,10 @@ class RealTimeMuxer(
     private var videoParser: Fmp4FragmentParser? = null
     private var audioParser: Fmp4FragmentParser? = null
 
+    // 视频 NAL 长度前缀字节数 (lengthSizeMinusOne + 1)，来自 init segment 的 avcC/hvcC。
+    // fMP4 样本为 AVCC(长度前缀) 格式，写入 MediaMuxer 前必须转成 Annex-B(起始码) 格式。
+    private var videoNalLengthSize = 4
+
     /** 公开给外部使用的 sample 数据结构 */
     data class QueuedSample(
         val pts: Long,
@@ -58,8 +61,13 @@ class RealTimeMuxer(
     /** 待解析的 fragment，携带它所属 segment 的 PDT（跨轨墙钟对齐用） */
     private data class PendingFragment(val data: ByteArray, val pdtMs: Long?)
 
-    private val videoSampleQueue = PriorityQueue<QueuedSample> { a, b -> a.pts.compareTo(b.pts) }
-    private val audioSampleQueue = PriorityQueue<QueuedSample> { a, b -> a.pts.compareTo(b.pts) }
+    // 关键：视频样本必须按【解码顺序】写入 MediaMuxer（H.264 含 B 帧时解码顺序 ≠ 显示顺序）。
+    // 若用 PriorityQueue 按 pts(显示时间) 排序，B 帧会被排到它所引用的参考帧之前写盘，
+    // 解码器解不出参考帧 -> 周期性花屏，到下一个 IDR 才恢复。因此视频轨必须用保序的 FIFO。
+    // MediaMuxer 会依据各样本的真实 presentationTimeUs 自行写入 ctts 表达显示顺序。
+    private val videoSampleQueue = ConcurrentLinkedQueue<QueuedSample>()
+    // 音频(AAC)无 B 帧，pts 天然单调，FIFO 与按 pts 排序等价；统一用 FIFO 避免任何重排。
+    private val audioSampleQueue = ConcurrentLinkedQueue<QueuedSample>()
 
     // 诊断：每条轨首个 sample 的墙钟 PTS 与收到时的墙钟，用于验证跨轨是否对齐
     @Volatile private var firstVideoPts: Long = Long.MIN_VALUE
@@ -82,7 +90,7 @@ class RealTimeMuxer(
     private val videoFragmentQueue = ConcurrentLinkedQueue<PendingFragment>()
     private val audioFragmentQueue = ConcurrentLinkedQueue<PendingFragment>()
 
-    // Mutex 保护 PriorityQueue 的并发访问
+    // Mutex 保护视频/音频样本队列的并发访问（ConcurrentLinkedQueue 本身线程安全，Mutex 用于保证跨多个操作的一致性）
     private val videoQueueMutex = Mutex()
     private val audioQueueMutex = Mutex()
 
@@ -96,6 +104,8 @@ class RealTimeMuxer(
         videoFormat = extractMediaFormat(data)
         val videoTimescale = Fmp4FragmentParser.parseTimescaleFromInitSegment(data)
         videoParser = Fmp4FragmentParser(taskId, videoTimescale)
+        videoNalLengthSize = Fmp4FragmentParser.parseNalLengthSizeFromInitSegment(data)
+        Log.d(TAG, "[$taskId] Video NAL length size = $videoNalLengthSize (from init segment)")
         if (videoFormat != null) {
             val mime = videoFormat!!.getString(MediaFormat.KEY_MIME) ?: "?"
             val w = videoFormat!!.getInteger(MediaFormat.KEY_WIDTH)
@@ -1542,10 +1552,55 @@ class RealTimeMuxer(
     private var totalVideoWritten = 0
     private var totalAudioWritten = 0
 
+    /**
+     * 将单个样本从 AVCC(长度前缀) 转换为 Annex-B(起始码 00 00 00 01) 格式。
+     *
+     * fMP4 mdat 里的样本是 [NAL长度(nalLengthSize字节)][NALU]...，
+     * 而 MediaMuxer/MPEG4Writer 只认 Annex-B 起始码：它内部用 getNextNALUnit 按
+     * 起始码扫描、剥离后再重新加长度前缀。直接把 AVCC 喂给它，NAL 会被错误切分 ->
+     * 解码器解不出任何 NAL -> 全程黑屏。因此必须在写入前完成转换。
+     *
+     * @param src 原始 AVCC 样本
+     * @param nalLengthSize NAL 长度前缀字节数 (2/3/4)
+     * @return Annex-B 格式样本；若本身已是起始码格式则原样返回（幂等保护）
+     */
+    private fun avccSampleToAnnexB(src: ByteArray, nalLengthSize: Int): ByteArray {
+        if (nalLengthSize < 1 || nalLengthSize > 4) return src
+        // 幂等保护：若样本开头已是起始码，直接返回（避免重复转换）
+        if (src.size >= 4 &&
+            src[0] == 0.toByte() && src[1] == 0.toByte() &&
+            (src[2] == 1.toByte() || (src[2] == 0.toByte() && src[3] == 1.toByte()))) {
+            return src
+        }
+        // 输出上界：nalLengthSize==4 时等长；更小时每 NAL 多 (4-nalLengthSize) 字节
+        val out = ByteArray(src.size + 4 * (src.size / (nalLengthSize + 1) + 1))
+        var outPos = 0
+        var pos = 0
+        while (pos + nalLengthSize <= src.size) {
+            var len = 0
+            for (i in 0 until nalLengthSize) {
+                len = (len shl 8) or (src[pos + i].toInt() and 0xFF)
+            }
+            pos += nalLengthSize
+            if (pos + len > src.size) break
+            // 写入 4 字节起始码 00 00 00 01
+            out[outPos++] = 0; out[outPos++] = 0; out[outPos++] = 0; out[outPos++] = 1
+            System.arraycopy(src, pos, out, outPos, len)
+            outPos += len
+            pos += len
+        }
+        return if (outPos == out.size) out else out.copyOf(outPos)
+    }
+
     private fun writeSampleToMuxer(trackIndex: Int, sample: QueuedSample): Boolean {
         try {
-            if (sample.data.size > buffer.capacity()) {
-                Log.w(TAG, "[$taskId] Sample too large: ${sample.data.size} > ${buffer.capacity()}")
+            val isVideo = trackIndex == videoTrackIndex
+            // 关键修复：fMP4 样本是 AVCC(长度前缀) 格式，而 MediaMuxer 期望 Annex-B(起始码)。
+            // 直接喂 AVCC 会导致 NAL 被错误切分 -> 黑屏。这里转换成起始码格式。
+            val outData = if (isVideo) avccSampleToAnnexB(sample.data, videoNalLengthSize) else sample.data
+
+            if (outData.size > buffer.capacity()) {
+                Log.w(TAG, "[$taskId] Sample too large: ${outData.size} > ${buffer.capacity()}")
                 return false
             }
 
@@ -1559,19 +1614,18 @@ class RealTimeMuxer(
             }
 
             buffer.clear()
-            buffer.put(sample.data)
+            buffer.put(outData)
             buffer.flip()
 
             val info = MediaCodec.BufferInfo().apply {
                 offset = 0
-                size = sample.data.size
+                size = outData.size
                 presentationTimeUs = relPts
                 flags = if (sample.isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
             }
 
             mediaMuxer?.writeSampleData(trackIndex, buffer, info)
 
-            val isVideo = trackIndex == videoTrackIndex
             if (isVideo) totalVideoWritten++ else totalAudioWritten++
 
             if (!muxerReady) {

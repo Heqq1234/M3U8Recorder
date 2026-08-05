@@ -96,6 +96,129 @@ class Fmp4FragmentParser(private val taskId: String, private val timescale: Long
             }
             return 0
         }
+
+        /**
+         * 从 fMP4 Init Segment 解析视频 NAL 长度前缀字节数 (lengthSizeMinusOne + 1)。
+         * avcC: 第5字节(索引4)低2位 = lengthSizeMinusOne
+         * hvcC: 第13字节(索引12)低2位 = lengthSizeMinusOne
+         * 找不到时返回默认 4。
+         */
+        fun parseNalLengthSizeFromInitSegment(initData: ByteArray): Int {
+            var pos = 0
+            while (pos + 8 <= initData.size) {
+                val size = readUint32Static(initData, pos)
+                if (size <= 0 || pos + size.toInt() > initData.size) break
+                val type = readFourccStatic(initData, pos + 4)
+                if (type == "moov") {
+                    val r = nalLenInMoov(initData, pos + 8, pos + size.toInt())
+                    if (r > 0) return r
+                }
+                pos += size.toInt()
+            }
+            return 4
+        }
+
+        private fun nalLenInMoov(data: ByteArray, start: Int, end: Int): Int {
+            var pos = start
+            while (pos + 8 <= end && pos + 8 <= data.size) {
+                val size = readUint32Static(data, pos)
+                if (size <= 0) break
+                val type = readFourccStatic(data, pos + 4)
+                if (type == "trak") {
+                    val r = nalLenInTrak(data, pos + 8, pos + size.toInt())
+                    if (r > 0) return r
+                }
+                pos += size.toInt()
+            }
+            return 0
+        }
+
+        private fun nalLenInTrak(data: ByteArray, start: Int, end: Int): Int {
+            var pos = start
+            while (pos + 8 <= end && pos + 8 <= data.size) {
+                val size = readUint32Static(data, pos)
+                if (size <= 0) break
+                val type = readFourccStatic(data, pos + 4)
+                if (type == "mdia") {
+                    val r = nalLenInMdia(data, pos + 8, pos + size.toInt())
+                    if (r > 0) return r
+                }
+                pos += size.toInt()
+            }
+            return 0
+        }
+
+        private fun nalLenInMdia(data: ByteArray, start: Int, end: Int): Int {
+            var pos = start
+            while (pos + 8 <= end && pos + 8 <= data.size) {
+                val size = readUint32Static(data, pos)
+                if (size <= 0) break
+                val type = readFourccStatic(data, pos + 4)
+                if (type == "minf") {
+                    val r = nalLenInMinf(data, pos + 8, pos + size.toInt())
+                    if (r > 0) return r
+                }
+                pos += size.toInt()
+            }
+            return 0
+        }
+
+        private fun nalLenInMinf(data: ByteArray, start: Int, end: Int): Int {
+            var pos = start
+            while (pos + 8 <= end && pos + 8 <= data.size) {
+                val size = readUint32Static(data, pos)
+                if (size <= 0) break
+                val type = readFourccStatic(data, pos + 4)
+                if (type == "stbl") {
+                    val r = nalLenInStbl(data, pos + 8, pos + size.toInt())
+                    if (r > 0) return r
+                }
+                pos += size.toInt()
+            }
+            return 0
+        }
+
+        private fun nalLenInStbl(data: ByteArray, start: Int, end: Int): Int {
+            var pos = start
+            while (pos + 8 <= end && pos + 8 <= data.size) {
+                val size = readUint32Static(data, pos)
+                if (size <= 0) break
+                val type = readFourccStatic(data, pos + 4)
+                if (type == "stsd") {
+                    val r = nalLenInStsd(data, pos + 8, pos + size.toInt())
+                    if (r > 0) return r
+                }
+                pos += size.toInt()
+            }
+            return 0
+        }
+
+        private fun nalLenInStsd(data: ByteArray, start: Int, end: Int): Int {
+            if (start + 8 > end || start + 8 > data.size) return 0
+            // stsd: version(1) + flags(3) + entry_count(4)
+            val entryCount = readUint32Static(data, start + 4)
+            if (entryCount <= 0) return 0
+            val entryPos = start + 8
+            if (entryPos + 8 > end || entryPos + 8 > data.size) return 0
+            val entrySize = readUint32Static(data, entryPos)
+            val entryEnd = minOf(entryPos + entrySize.toInt(), end, data.size)
+            var cpos = entryPos + 8 // skip sample entry header (size + type)
+            while (cpos + 8 <= entryEnd) {
+                val csize = readUint32Static(data, cpos)
+                if (csize <= 0 || cpos + csize.toInt() > entryEnd) break
+                val ctype = readFourccStatic(data, cpos + 4)
+                if (ctype == "avcC") {
+                    val p = cpos + 8
+                    if (p < data.size) return (data[p].toInt() and 0x03) + 1
+                } else if (ctype == "hvcC") {
+                    val p = cpos + 12
+                    if (p < data.size) return (data[p].toInt() and 0x03) + 1
+                }
+                cpos += csize.toInt()
+            }
+            return 0
+        }
+
         private fun readUint32Static(data: ByteArray, offset: Int): Long {
             return ((data[offset].toLong() and 0xFF) shl 24) or
                     ((data[offset + 1].toLong() and 0xFF) shl 16) or
@@ -110,8 +233,10 @@ class Fmp4FragmentParser(private val taskId: String, private val timescale: Long
         val samples = mutableListOf<ParsedSample>()
         try {
             var pos = 0
+            var firstMoof = true
             while (pos + 8 <= fragmentData.size) {
                 val size = readUint32(fragmentData, pos)
+                if (size <= 0) break
                 val type = readFourcc(fragmentData, pos + 4)
                 if (type == "moof") {
                     val moofStartPos = pos  // 记录 moof 起始位置，用于修正 dataOffset
@@ -122,6 +247,7 @@ class Fmp4FragmentParser(private val taskId: String, private val timescale: Long
                     var cttsData: CttsData? = null
                     while (moofPos + 8 <= moofEnd) {
                         val childSize = readUint32(fragmentData, moofPos)
+                        if (childSize <= 0) break
                         val childType = readFourcc(fragmentData, moofPos + 4)
                         if (childType == "traf") {
                             val trafEnd = moofPos + childSize.toInt()
@@ -129,6 +255,7 @@ class Fmp4FragmentParser(private val taskId: String, private val timescale: Long
                             var tfhd: TfhdData? = null
                             while (trafPos + 8 <= trafEnd) {
                                 val trafChildSize = readUint32(fragmentData, trafPos)
+                                if (trafChildSize <= 0) break
                                 val trafChildType = readFourcc(fragmentData, trafPos + 4)
                                 when (trafChildType) {
                                     "tfhd" -> tfhd = parseTfhd(fragmentData, trafPos, trafChildSize.toInt())
@@ -164,30 +291,38 @@ class Fmp4FragmentParser(private val taskId: String, private val timescale: Long
                         moofPos += childSize.toInt()
                     }
                     if (trun != null && tfdt >= 0) {
-                        // 更新当前分片的基准时间
-                        baseMediaDecodeTime = tfdt
-                        pos = moofEnd
-                        if (pos + 8 <= fragmentData.size) {
-                            val nextSize = readUint32(fragmentData, pos)
-                            val nextType = readFourcc(fragmentData, pos + 4)
-                            if (nextType == "mdat") {
-                                val mdatDataSize = nextSize.toInt() - 8
+                        // 仅用首个 moof 的 tfdt 作为本分片基准（RealTimeMuxer 跨轨对齐用）
+                        if (firstMoof) {
+                            baseMediaDecodeTime = tfdt
+                            firstMoof = false
+                        }
+                        // 在 moof 之后查找 mdat（通常紧跟其后的下一个 box）
+                        // 一个完整 segment 可能含多个 moof+mdat 对，必须逐个解析，否则会丢帧/黑屏
+                        var mdatPos = moofEnd
+                        while (mdatPos + 8 <= fragmentData.size) {
+                            val mSize = readUint32(fragmentData, mdatPos)
+                            if (mSize <= 0) break
+                            val mType = readFourcc(fragmentData, mdatPos + 4)
+                            if (mType == "mdat") {
+                                val mdatDataSize = mSize.toInt() - 8
                                 if (mdatDataSize > 0) {
                                     val mdatData = ByteArray(mdatDataSize)
-                                    System.arraycopy(fragmentData, pos + 8, mdatData, 0, mdatData.size)
+                                    System.arraycopy(fragmentData, mdatPos + 8, mdatData, 0, mdatData.size)
                                     // data_offset 是相对于 moof 开头的偏移（ISO BMFF 规范）
-                                    // moof 在 fragmentData 中的起始位置是 moofStartPos
-                                    // 所以 mdat 内容在 fragmentData 中的绝对位置 = moofStartPos + dataOffset
-                                    // 而 mdatData 是从 pos+8 开始的，所以相对偏移 = (moofStartPos + dataOffset) - (pos + 8)
-                                    val correctedDataOffset = maxOf(0, moofStartPos + trun.dataOffset - (pos + 8))
+                                    // mdat 内容在 fragmentData 中的绝对位置 = moofStartPos + dataOffset
+                                    // 而 mdatData 是从 mdatPos+8 开始的，所以相对偏移 = (moofStartPos + dataOffset) - (mdatPos + 8)
+                                    val correctedDataOffset = maxOf(0, moofStartPos + trun.dataOffset - (mdatPos + 8))
                                     samples.addAll(extractSamplesFromMdat(mdatData, tfdt, trun, correctedDataOffset, cttsData))
                                 }
+                                break
                             }
+                            mdatPos += mSize.toInt()
                         }
                     }
-                    break
+                    pos = moofEnd
+                } else {
+                    pos += size.toInt()
                 }
-                pos += size.toInt()
             }
         } catch (e: Exception) {
             Log.w(TAG, "[$taskId] Failed to parse fragment (${fragmentData.size} bytes)", e)
