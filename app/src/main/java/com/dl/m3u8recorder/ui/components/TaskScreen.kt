@@ -524,7 +524,16 @@ fun TaskScreen(
                     if (currentIsScheduled) {
                         DownloadManager.addScheduledTask(task)
                     } else {
-                        DownloadManager.addTask(videoUrl, currentFilename.ifBlank { chaturbateRoomSlug }, true, true, currentDownloadUri, audioTrackUrl = audioUrl)
+                        DownloadManager.addTask(
+                            url = videoUrl,
+                            fileName = currentFilename.ifBlank { chaturbateRoomSlug },
+                            realtimeMerge = true,
+                            isLive = true,
+                            downloadDirectoryUri = currentDownloadUri,
+                            audioTrackUrl = audioUrl,
+                            platform = "chaturbate",
+                            roomSlug = chaturbateRoomSlug
+                        )
                     }
 
                     filename = ""
@@ -586,7 +595,17 @@ fun TaskScreen(
                     if (currentIsScheduled) {
                         DownloadManager.addScheduledTask(task)
                     } else {
-                        DownloadManager.addTask(videoUrl, currentFilename.ifBlank { currentRoomInfo.slug }, true, true, currentDownloadUri, audioTrackUrl = audioUrl)
+                        DownloadManager.addTask(
+                            url = videoUrl,
+                            fileName = currentFilename.ifBlank { currentRoomInfo.slug },
+                            realtimeMerge = true,
+                            isLive = true,
+                            downloadDirectoryUri = currentDownloadUri,
+                            audioTrackUrl = audioUrl,
+                            platform = "stripchat",
+                            roomSlug = currentRoomInfo.slug,
+                            roomBaseUrl = currentRoomInfo.baseUrl
+                        )
                     }
 
                     filename = ""

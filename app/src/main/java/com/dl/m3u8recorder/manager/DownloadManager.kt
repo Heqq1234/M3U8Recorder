@@ -318,7 +318,10 @@ object DownloadManager {
         isLive: Boolean = false,
         downloadDirectoryUri: Uri?,
         preferredResolution: Int? = null,
-        audioTrackUrl: String? = null
+        audioTrackUrl: String? = null,
+        platform: String? = null,
+        roomSlug: String? = null,
+        roomBaseUrl: String? = null
     ) {
         CoroutineScope(Dispatchers.IO).launch {
             if (isLive) {
@@ -332,9 +335,13 @@ object DownloadManager {
                         isLive = true,
                         customDownloadUri = downloadDirectoryUri?.toString(),
                         isLLHls = true,
-                        audioTrackUrl = audioTrackUrl
+                        audioTrackUrl = audioTrackUrl,
+                        // 保存平台信息，重试时可重新取流(旧 URL 会过期)
+                        platform = platform,
+                        roomSlug = roomSlug,
+                        roomBaseUrl = roomBaseUrl
                     )
-                    Log.d(TAG, "addTask (live direct): ${task.id} audio=${audioTrackUrl != null}")
+                    Log.d(TAG, "addTask (live direct): ${task.id} platform=$platform audio=${audioTrackUrl != null}")
                     currentTasksState[task.id] = task
                     notifyQueueChanged()
                     LiveRecordingService.startService(appContext, task)
@@ -866,6 +873,8 @@ object DownloadManager {
     /**
      * 重试指定任务（通常用于取消或失败的任务）。
      * 重置任务状态并重新启动。
+     * 平台任务(Chaturbate/Stripchat)：重新调 API 取流，因为旧 URL 的 CDN 签名会过期。
+     * 手动 URL 任务：直接用原 URL 重试。
      * @param taskId 要重试的任务 ID。
      */
     fun retryTask(taskId: String) {
@@ -874,18 +883,113 @@ object DownloadManager {
             task.isCancelled = false
             task.isPaused = false
             task.progress = 0
-            task.statusMessage = "重试中"
-            // 【关键修改】重置下载大小和时间，确保从头开始
             task._downloadedSize.value = 0L
             task._elapsedTime.value = 0L
-            notifyTaskUpdated(task) // 通知 UI 状态已重置
+            notifyTaskUpdated(task)
 
             if (task.isLive) {
-                LiveRecordingService.startService(appContext, task) // 启动直播录制服务
+                if (task.platform != null && !task.roomSlug.isNullOrBlank()) {
+                    // 平台任务：重新取流(旧 URL 的 CDN 签名已过期)
+                    task.statusMessage = "重新获取直播流地址..."
+                    notifyTaskUpdated(task)
+                    refetchAndRetry(task)
+                } else {
+                    // 手动 URL 直播任务：直接用原 URL 重试
+                    task.statusMessage = "重试中"
+                    notifyTaskUpdated(task)
+                    LiveRecordingService.startService(appContext, task)
+                }
             } else {
-                startDownloadJob(task) // 启动非直播下载 Job
+                task.statusMessage = "重试中"
+                notifyTaskUpdated(task)
+                startDownloadJob(task)
             }
             Log.d(TAG, "retryTask: 重新启动任务 ${task.id}.")
+        }
+    }
+
+    /**
+     * 重新调平台 API 取流并启动录制。
+     * 重试间隔短(15秒)，最多 3 次——用户在等，不需要像定时任务那样等 10 分钟。
+     */
+    private fun refetchAndRetry(task: DownloadTask) {
+        retryJobs[task.id]?.cancel()
+        retryJobs[task.id] = CoroutineScope(Dispatchers.IO).launch {
+            val maxRetries = 3
+            val retryIntervalMs = 15 * 1000L
+
+            for (attempt in 1..maxRetries) {
+                if (!isActive) return@launch
+
+                // 1. 调平台 API 取流
+                val fetchResult = when (task.platform) {
+                    "chaturbate" -> ChaturbateApi.fetchStreamUrl(task.roomSlug!!)
+                    "stripchat" -> StripchatApi.fetchStreamUrl(
+                        StripchatApi.RoomInfo(slug = task.roomSlug!!, baseUrl = task.roomBaseUrl ?: "")
+                    )
+                    else -> {
+                        task.statusMessage = "配置错误：未知平台 ${task.platform}"
+                        task.isCancelled = true
+                        notifyTaskUpdated(task)
+                        return@launch
+                    }
+                }
+
+                if (!fetchResult.isSuccess) {
+                    val msg = fetchResult.errorMessage ?: "未获取到流"
+                    Log.d(TAG, "重试取流 ${task.id} 失败($attempt/$maxRetries): $msg")
+                    if (attempt < maxRetries) {
+                        task.statusMessage = "取流失败，${retryIntervalMs / 1000}秒后重试($attempt/$maxRetries)"
+                        notifyTaskUpdated(task)
+                        delay(retryIntervalMs)
+                    } else {
+                        task.statusMessage = "重试失败：$msg"
+                        task.isCancelled = true
+                        notifyTaskUpdated(task)
+                    }
+                    continue
+                }
+
+                // 2. resolveMasterPlaylist 拿 video/audio media URL
+                val resolved = when (task.platform) {
+                    "chaturbate" -> ChaturbateApi.resolveMasterPlaylist(fetchResult.m3u8Url)
+                    "stripchat" -> StripchatApi.resolveMasterPlaylist(fetchResult.m3u8Url, task.roomBaseUrl)
+                    else -> null
+                }
+                if (resolved == null || resolved.videoPlaylistUrl.isBlank()) {
+                    val msg = resolved?.errorMessage ?: "解析播放列表失败"
+                    Log.d(TAG, "重试 resolve ${task.id} 失败($attempt/$maxRetries): $msg")
+                    if (attempt < maxRetries) {
+                        task.statusMessage = "解析失败，重试中($attempt/$maxRetries)"
+                        notifyTaskUpdated(task)
+                        delay(retryIntervalMs)
+                    } else {
+                        task.statusMessage = "重试失败：$msg"
+                        task.isCancelled = true
+                        notifyTaskUpdated(task)
+                    }
+                    continue
+                }
+
+                // 3. 成功：用新 URL 更新任务并启动录制
+                Log.d(TAG, "重试取流 ${task.id} 成功: ${resolved.videoPlaylistUrl.take(80)}")
+                val liveTask = task.copy(
+                    url = resolved.videoPlaylistUrl,
+                    audioTrackUrl = resolved.audioPlaylistUrl,
+                    isLLHls = true
+                ).apply {
+                    statusMessage = "取流成功，开始录制"
+                    progress = 0
+                    isCancelled = false
+                    isPaused = false
+                }
+                liveTask._downloadedSize.value = 0L
+                liveTask._elapsedTime.value = 0L
+                currentTasksState[task.id] = liveTask
+                notifyTaskUpdated(liveTask)
+                LiveRecordingService.startService(appContext, liveTask)
+                return@launch
+            }
         }
     }
 

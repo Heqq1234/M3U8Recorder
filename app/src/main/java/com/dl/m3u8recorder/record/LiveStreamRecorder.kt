@@ -370,6 +370,10 @@ class LiveStreamRecorder(private val context: Context) {
                         task.statusMessage = "录制完成"
                         task.progress = 100
                         DownloadManager.notifyTaskUpdated(task)
+                    } else {
+                        task.statusMessage = "合成失败，可点击重试"
+                        task.isCancelled = true
+                        DownloadManager.notifyTaskUpdated(task)
                     }
                 }
             }
