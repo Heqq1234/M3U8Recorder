@@ -209,9 +209,9 @@ fun TaskScreen(
                 extractedBestUrl = null
             },
             label = { Text(if (isM3U8Content) "M3U8内容 (已检测)" else "M3U8链接") },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp, max = 200.dp),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 100.dp),
             textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp),
-            maxLines = 10,
+            maxLines = 3,
         )
 
         // 如果检测到是 M3U8 内容，显示基础 URL 输入框
@@ -225,9 +225,9 @@ fun TaskScreen(
                 },
                 label = { Text("基础URL (curl命令中的URL)") },
                 placeholder = { Text("例如: https://example.com/stream.m3u8", fontSize = 11.sp) },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 80.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp, max = 56.dp),
                 textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 11.sp),
-                maxLines = 2,
+                maxLines = 1,
             )
             Text(
                 text = "提示: 输入 curl 命令中 curl 后面的 URL 作为基础 URL，用于解析相对路径",
@@ -239,46 +239,55 @@ fun TaskScreen(
 
         // --- Phase 5: Chaturbate 房间模式 ---
         chaturbateRoomSlug?.let { room ->
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer
                 )
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
+                Column(modifier = Modifier.padding(8.dp)) {
                     Text(
                         text = "Chaturbate 房间: $room",
                         style = MaterialTheme.typography.titleSmall,
-                        fontSize = 13.sp
+                        fontSize = 12.sp,
+                        lineHeight = 15.sp
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(1.dp))
                     Text(
                         text = "App 将通过 WebView 连接房间，自动获取直播流地址",
                         fontSize = 10.sp,
+                        lineHeight = 13.sp,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "文件名",
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        OutlinedTextField(
-                            value = filename,
-                            onValueChange = { filename = it },
-                            label = { Text("文件名") },
-                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                            singleLine = true,
-                            textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Button(
-                            onClick = {
-                                if (filename.isNotBlank()) {
-                                    showChaturbateDialog = true
-                                }
-                            },
+                                OutlinedTextField(
+                                    value = filename,
+                                    onValueChange = { filename = it },
+                                    placeholder = { Text("文件名", fontSize = 12.sp) },
+                                    modifier = Modifier.weight(1f).heightIn(min = 36.dp),
+                                    singleLine = true,
+                                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Button(
+                                    onClick = {
+                                        if (filename.isNotBlank()) {
+                                            showChaturbateDialog = true
+                                        }
+                                    },
                             enabled = filename.isNotBlank()
                         ) {
                             Text(if (isScheduled) "定时录制" else "连接并录制", fontSize = 13.sp)
@@ -286,56 +295,66 @@ fun TaskScreen(
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(2.dp))
         }
 
         // --- Stripchat 房间模式 ---
         stripchatRoomInfo?.let { room ->
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.secondaryContainer
                 )
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
+                Column(modifier = Modifier.padding(8.dp)) {
                     Text(
                         text = "Stripchat 房间: ${room.slug}",
                         style = MaterialTheme.typography.titleSmall,
-                        fontSize = 13.sp
+                        fontSize = 12.sp,
+                        lineHeight = 15.sp
                     )
                     Text(
                         text = "站点: ${room.baseUrl}",
                         fontSize = 10.sp,
+                        lineHeight = 13.sp,
                         color = MaterialTheme.colorScheme.onSecondaryContainer
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
                         text = "自动获取直播流地址，支持官方和合作站点",
                         fontSize = 10.sp,
+                        lineHeight = 13.sp,
                         color = MaterialTheme.colorScheme.onSecondaryContainer
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "文件名",
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        OutlinedTextField(
-                            value = filename,
-                            onValueChange = { filename = it },
-                            label = { Text("文件名") },
-                            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
-                            singleLine = true,
-                            textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Button(
-                            onClick = {
-                                if (filename.isNotBlank()) {
-                                    showStripchatDialog = true
-                                }
-                            },
+                                OutlinedTextField(
+                                    value = filename,
+                                    onValueChange = { filename = it },
+                                    placeholder = { Text("文件名", fontSize = 12.sp) },
+                                    modifier = Modifier.weight(1f).heightIn(min = 36.dp),
+                                    singleLine = true,
+                                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Button(
+                                    onClick = {
+                                        if (filename.isNotBlank()) {
+                                            showStripchatDialog = true
+                                        }
+                                    },
                             enabled = filename.isNotBlank()
                         ) {
                             Text(if (isScheduled) "定时录制" else "连接并录制", fontSize = 13.sp)
@@ -343,7 +362,7 @@ fun TaskScreen(
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(2.dp))
         }
 
         // --- 保存路径（所有模式下可见） ---
@@ -402,7 +421,7 @@ fun TaskScreen(
             value = filename,
             onValueChange = { filename = it },
             label = { Text("文件名") },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp, max = 56.dp),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = 48.dp),
             singleLine = true,
             textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp)
         )
@@ -661,7 +680,7 @@ fun TaskScreen(
 
         Divider(modifier = Modifier.padding(vertical = 8.dp))
 
-        LazyColumn(modifier = Modifier.fillMaxHeight()) {
+        LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
             items(taskList, key = { it.id }) { task ->
                 TaskItem(
                     task = task,
