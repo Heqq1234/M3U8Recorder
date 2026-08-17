@@ -10,6 +10,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import java.io.IOException
 import java.util.TreeMap
 import java.util.concurrent.ConcurrentHashMap
@@ -41,62 +42,130 @@ class PartDownloader(
     /**
      * 下载片段数据（内部使用，支持快速失败和连接复用）
      * 注意：调用方应已在 Dispatchers.IO 上，不再包裹 withContext
-     * @param uri 片段 URI
+     * @param uri 片段 URI（裸 URL，与浏览器 HLS 播放器一致）
      * @param taskId 任务 ID，用于日志追踪
+     * @param authQuery 可选：playlist 的鉴权查询参数（pkey/psch/playlistType 等）。
+     *                  当裸 URL 404 时，补回该查询参数重试一次（实验性，仅 Stripchat 传入）。
      * @return 片段数据，失败返回 null
      */
-    private fun downloadInternal(uri: String, taskId: String = ""): ByteArray? {
-        val startMs = System.currentTimeMillis()
-        var lastException: Exception? = null
+    private fun downloadInternal(
+        uri: String,
+        taskId: String = "",
+        authQuery: String? = null
+    ): ByteArray? {
         val tagPrefix = if (taskId.isNotEmpty()) "[$taskId] " else ""
 
-        repeat(MAX_RETRIES) { attempt ->
+        // 第一轮：裸 URL（与浏览器 HLS 播放器一致）
+        val bare = tryDownload(uri, tagPrefix, emitDiagnostics = true)
+        if (bare != null) return bare
+
+        // 第二轮：404 时补回 playlist 鉴权查询参数重试。
+        // 浏览器能 200 是因为 CloudFront 边缘缓存命中；手机上对源站的全新请求可能需 pkey 授权。
+        // 仅当 authQuery 存在且裸 URL 本身无查询参数时尝试（平台隔离：Chaturbate 不传 authQuery）。
+        if (authQuery != null && !uri.contains("?")) {
+            val authedUri = "$uri?$authQuery"
+            Log.w(TAG, "${tagPrefix}404 → 补 pkey 重试: ${authedUri.takeLast(90)}")
+            val authed = tryDownload(authedUri, tagPrefix, emitDiagnostics = true)
+            if (authed != null) {
+                Log.w(TAG, "${tagPrefix}★ 补 pkey 后成功 ✓ ${authedUri.takeLast(90)}")
+                return authed
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * 实际执行下载（含重试与退避）。on 404 时若 emitDiagnostics 且尚未打过，输出完整响应诊断。
+     * @param maxRetries 重试次数。
+     */
+    private fun tryDownload(
+        targetUri: String,
+        tagPrefix: String,
+        emitDiagnostics: Boolean,
+        maxRetries: Int = MAX_RETRIES
+    ): ByteArray? {
+        val startMs = System.currentTimeMillis()
+        var lastException: Exception? = null
+        var diagEmitted = false
+        repeat(maxRetries) { attempt ->
             try {
-                // 请求头由 client 的 interceptor 统一设置
+                // 请求头由 client 的 interceptor 统一设置（Referer/Origin/Sec-Fetch 等）
                 val request = Request.Builder()
-                    .url(uri)
+                    .url(targetUri)
                     .build()
 
                 val response = client.newCall(request).execute()
                 val elapsed = System.currentTimeMillis() - startMs
 
                 if (response.isSuccessful) {
+                    val ct = response.header("Content-Type") ?: ""
                     val bytes = response.body?.bytes()
                     if (bytes != null && bytes.isNotEmpty()) {
-                        Log.d(TAG, "${tagPrefix}Downloaded: ${uri.takeLast(60)} (${bytes.size} bytes, ${elapsed}ms), attempt ${attempt + 1}")
+                        Log.d(TAG, "${tagPrefix}Downloaded: ${targetUri.takeLast(60)} (${bytes.size} bytes, ${elapsed}ms), attempt ${attempt + 1}")
                         return bytes
                     } else {
-                        Log.w(TAG, "${tagPrefix}Empty body: ${uri.takeLast(60)}, attempt ${attempt + 1}")
+                        Log.w(TAG, "${tagPrefix}Empty body: ${targetUri.takeLast(60)}, attempt ${attempt + 1}")
                     }
                 } else if (response.code in 400..499) {
                     // 404/429 可能是临时的（live edge 还没准备好 / 限流），重试
                     // 其他 4xx（400, 401, 403, 405+）永久跳过
                     if (response.code == 404 || response.code == 429) {
-                        Log.w(TAG, "${tagPrefix}HTTP ${response.code}: ${uri.takeLast(60)}, 可能临时错误，重试 (${attempt + 1}/${MAX_RETRIES})")
+                        if (emitDiagnostics && !diagEmitted) {
+                            diagEmitted = true
+                            logSegmentDiagnostics(tagPrefix, response)
+                        }
+                        Log.w(TAG, "${tagPrefix}HTTP ${response.code}: ${targetUri.takeLast(60)}, 可能临时错误，重试 (${attempt + 1}/${maxRetries})")
                         lastException = IOException("HTTP ${response.code}")
                     } else {
-                        Log.w(TAG, "${tagPrefix}HTTP ${response.code}: ${uri.takeLast(60)}, 跳过 (永久 4xx 错误)")
+                        Log.w(TAG, "${tagPrefix}HTTP ${response.code}: ${targetUri.takeLast(60)}, 跳过 (永久 4xx 错误)")
                         return null
                     }
                 } else {
-                    Log.w(TAG, "${tagPrefix}HTTP ${response.code}: ${uri.takeLast(60)}, attempt ${attempt + 1}, elapsed=${elapsed}ms")
+                    Log.w(TAG, "${tagPrefix}HTTP ${response.code}: ${targetUri.takeLast(60)}, attempt ${attempt + 1}, elapsed=${elapsed}ms")
                 }
             } catch (e: Exception) {
                 lastException = e
                 val elapsed = System.currentTimeMillis() - startMs
-                Log.w(TAG, "${tagPrefix}Download exception attempt ${attempt + 1}: ${uri.takeLast(60)}, elapsed=${elapsed}ms", e)
+                Log.w(TAG, "${tagPrefix}Download exception attempt ${attempt + 1}: ${targetUri.takeLast(60)}, elapsed=${elapsed}ms", e)
             }
 
             // 指数退避重试，但更快
-            if (attempt < MAX_RETRIES - 1) {
+            if (attempt < maxRetries - 1) {
                 Thread.sleep(100L * (attempt + 1)) // 100ms, 200ms, 300ms
             }
         }
-
-        val totalElapsed = System.currentTimeMillis() - startMs
-        Log.e(TAG, "${tagPrefix}Failed to download after $MAX_RETRIES attempts (${totalElapsed}ms): ${uri.takeLast(60)}", lastException)
         return null
     }
+
+    /**
+     * 分片 404 全量诊断：打出【实际发出的请求头（interceptor 之后）】+ 完整响应头 + 响应体前 1KB。
+     * 请求头能确认 Referer/Origin 等是否真的按预期带出（用于核对反盗链域名），
+     * 响应头常说明 404 根因（NoSuchKey / Missing Token / Geo Blocked 等）。
+     * 注意：必须用 response.request（经过拦截器后的网络请求），原始 Request 此时还没有任何头。
+     */
+    private fun logSegmentDiagnostics(tagPrefix: String, response: Response) {
+        val sb = StringBuilder()
+        sb.appendLine("${tagPrefix}═══ SEGMENT 404 DIAGNOSTICS ═══")
+        sb.appendLine("REQUEST URL: ${response.request.url}")
+        sb.appendLine("--- request headers (sent, AFTER interceptors) ---")
+        val reqHdrs = response.request.headers
+        if (reqHdrs.size == 0) {
+            sb.appendLine("  (none — 说明该请求没有任何头；若期望有 Referer/Origin，请检查下载所用 client 的拦截器是否真的挂上了)")
+        }
+        for (i in 0 until reqHdrs.size) {
+            sb.appendLine("  ${reqHdrs.name(i)}: ${reqHdrs.value(i)}")
+        }
+        sb.appendLine("--- response headers ---")
+        for (i in 0 until response.headers.size) {
+            sb.appendLine("  ${response.headers.name(i)}: ${response.headers.value(i)}")
+        }
+        val body = runCatching { response.peekBody(1024).string() }.getOrNull() ?: "<unavailable>"
+        sb.appendLine("--- response body (≤1024B) ---")
+        sb.appendLine(body)
+        Log.e(TAG, sb.toString())
+    }
+
 
     /**
      * 下载初始化片段 (EXT-X-MAP)
@@ -185,6 +254,7 @@ class PartDownloader(
     suspend fun downloadParallelOrdered(
         taskId: String,
         items: List<DownloadItem>,
+        authQuery: String? = null,
         onWrite: suspend (index: Int, data: ByteArray?, pdtMs: Long?) -> Unit
     ) = coroutineScope {
         if (items.isEmpty()) return@coroutineScope
@@ -202,7 +272,7 @@ class PartDownloader(
         items.map { item ->
             async(Dispatchers.IO) {
                 val itemStartMs = System.currentTimeMillis()
-                val data = downloadInternal(item.uri, taskId)
+                val data = downloadInternal(item.uri, taskId, authQuery)
                 val itemElapsed = System.currentTimeMillis() - itemStartMs
 
                 if (data == null) {

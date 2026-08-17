@@ -575,9 +575,9 @@ fun TaskScreen(
             StripchatConnectDialog(
                 roomInfo = currentRoomInfo,
                 onDismiss = { showStripchatDialog = false },
-                onStreamUrlObtained = { videoUrl, audioUrl, _ ->
+                onStreamUrlObtained = { videoUrl, audioUrl, resolution ->
                     showStripchatDialog = false
-                    Log.d("TaskScreen", "Stripchat 获取到流地址，isScheduled=$currentIsScheduled")
+                    Log.d("TaskScreen", "Stripchat 获取到流地址，isScheduled=$currentIsScheduled, resolution=$resolution")
 
                     val scheduledStartTime = if (currentIsScheduled) {
                         val calendar = Calendar.getInstance()
@@ -608,7 +608,8 @@ fun TaskScreen(
                         // 定时任务存平台+房间号，到期可重新取流(主播未开播重试)
                         platform = "stripchat",
                         roomSlug = currentRoomInfo.slug,
-                        roomBaseUrl = currentRoomInfo.baseUrl
+                        roomBaseUrl = currentRoomInfo.baseUrl,
+                        selectedResolution = resolution
                     )
 
                     if (currentIsScheduled) {
@@ -621,6 +622,7 @@ fun TaskScreen(
                             isLive = true,
                             downloadDirectoryUri = currentDownloadUri,
                             audioTrackUrl = audioUrl,
+                            selectedResolution = resolution,
                             platform = "stripchat",
                             roomSlug = currentRoomInfo.slug,
                             roomBaseUrl = currentRoomInfo.baseUrl

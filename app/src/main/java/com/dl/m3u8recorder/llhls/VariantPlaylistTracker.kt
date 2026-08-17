@@ -75,7 +75,7 @@ class VariantPlaylistTracker(
      */
     suspend fun trackPlaylist(
         playlistUrl: String,
-        onNewSegments: suspend (List<Segment>) -> Unit,
+        onNewSegments: suspend (List<Segment>, List<Part>) -> Unit,
         onInitSegment: suspend (InitSegment) -> Unit,
         isOtherTrackerActive: () -> Boolean = { false }
     ) = withContext(Dispatchers.IO) {
@@ -95,7 +95,7 @@ class VariantPlaylistTracker(
                 if (!state.isLive) {
                     Log.d(TAG, "播放列表包含 ENDLIST 标记，直播流已结束")
                     if (state.segments.isNotEmpty()) {
-                        onNewSegments(state.segments)
+                        onNewSegments(state.segments, state.parts)
                     }
                     return@withContext
                 }
@@ -113,13 +113,17 @@ class VariantPlaylistTracker(
 
                 val newSegments = detectNewSegments(state)
                 if (newSegments.isNotEmpty()) {
-                    Log.w(TAG, "发现 ${newSegments.size} 个新完整片段 (mediaSequence=${state.mediaSequence}, segments=${state.segments.size})")
+                    // 收集这些新片段对应的 PART 分块（LL-HLS 直播边缘整段可能尚未落地而 404，
+                    // PART 分块一定可用，供下载层在整段失败时回退）。
+                    val newSeqs = newSegments.map { it.sequenceNumber }.toSet()
+                    val newParts = state.parts.filter { it.sequenceNumber in newSeqs }
+                    Log.w(TAG, "发现 ${newSegments.size} 个新完整片段 (mediaSequence=${state.mediaSequence}, segments=${state.segments.size}), 关联 PART=${newParts.size}")
                     // 打印每个新片段的 URI
                     newSegments.forEachIndexed { idx, seg ->
                         Log.d(TAG, "  片段[$idx]: uri=${seg.uri.take(80)} duration=${seg.duration}s " +
                                 "pdt=${seg.programDateTimeMs?.let { java.util.Date(it) } ?: "无"}")
                     }
-                    onNewSegments(newSegments)
+                    onNewSegments(newSegments, newParts)
                     lastSegmentTime = System.currentTimeMillis()
                 }
 

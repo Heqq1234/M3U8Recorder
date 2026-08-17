@@ -41,6 +41,11 @@ class RealTimeMuxer(
     @Volatile private var isStarted = false
     @Volatile private var isStopped = false
 
+    // 视频分辨率覆盖值（形如 "1920x1080"）。非空时覆盖 init segment 解析出的宽高。
+    // 仅 Stripchat 等"各变体共用同一 init、其 tkhd 占位分辨率与真实变体不符"的场景会设置；
+    // Chaturbate 不设此值，行为完全不变。
+    @Volatile private var videoResolutionOverride: String? = null
+
     // 视频首帧丢弃计数
     private var droppedVideoFrames = 0
 
@@ -99,6 +104,18 @@ class RealTimeMuxer(
     private var parseJob: Job? = null
     private val buffer = ByteBuffer.allocate(2 * 1024 * 1024)
 
+    /**
+     * 设置视频分辨率覆盖（形如 "1920x1080"）。
+     * 必须在 setVideoInitData 之前调用。非空时，用真实变体分辨率覆盖从 init segment
+     * 解析出的宽高（部分站点 tkhd 是占位分辨率，与真实变体不符，导致 MediaMuxer 建轨
+     * 宽高不匹配、native writer 拒写 -> 录制出 3KB 空文件）。
+     * 不设置（null）时完全沿用原逻辑。
+     */
+    fun setVideoResolutionOverride(resolution: String?) {
+        videoResolutionOverride = resolution
+        Log.d(TAG, "[$taskId] Video resolution override: ${resolution ?: "null(沿用 init 分辨率)"}")
+    }
+
     @Synchronized
     fun setVideoInitData(data: ByteArray) {
         videoFormat = extractMediaFormat(data)
@@ -108,8 +125,22 @@ class RealTimeMuxer(
         Log.d(TAG, "[$taskId] Video NAL length size = $videoNalLengthSize (from init segment)")
         if (videoFormat != null) {
             val mime = videoFormat!!.getString(MediaFormat.KEY_MIME) ?: "?"
-            val w = videoFormat!!.getInteger(MediaFormat.KEY_WIDTH)
-            val h = videoFormat!!.getInteger(MediaFormat.KEY_HEIGHT)
+            var w = videoFormat!!.getInteger(MediaFormat.KEY_WIDTH)
+            var h = videoFormat!!.getInteger(MediaFormat.KEY_HEIGHT)
+            // 用真实变体分辨率覆盖 init 占位分辨率（仅 Stripchat 等设置了覆盖值的路径触发）
+            videoResolutionOverride?.let { res ->
+                val parts = res.split("x")
+                if (parts.size == 2) {
+                    val ow = parts[0].toIntOrNull()
+                    val oh = parts[1].toIntOrNull()
+                    if (ow != null && oh != null && ow > 0 && oh > 0) {
+                        videoFormat!!.setInteger(MediaFormat.KEY_WIDTH, ow)
+                        videoFormat!!.setInteger(MediaFormat.KEY_HEIGHT, oh)
+                        Log.w(TAG, "[$taskId] ★ 用真实分辨率覆盖 init 占位分辨率: ${w}x${h} -> ${ow}x${oh}")
+                        w = ow; h = oh
+                    }
+                }
+            }
             Log.d(TAG, "[$taskId] Video format: $mime ${w}x${h}, timescale=$videoTimescale")
         } else {
             Log.e(TAG, "[$taskId] Failed to extract video format")

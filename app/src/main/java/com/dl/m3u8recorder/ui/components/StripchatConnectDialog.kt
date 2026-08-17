@@ -21,7 +21,7 @@ import kotlinx.coroutines.launch
 fun StripchatConnectDialog(
     roomInfo: StripchatApi.RoomInfo,
     onDismiss: () -> Unit,
-    onStreamUrlObtained: (videoUrl: String, audioUrl: String?, m3u8Url: String) -> Unit
+    onStreamUrlObtained: (videoUrl: String, audioUrl: String?, resolution: String?) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var statusText by remember { mutableStateOf("") }
@@ -141,7 +141,7 @@ fun StripchatConnectDialog(
                                         onStreamUrlObtained(
                                             resolved.videoPlaylistUrl,
                                             resolved.audioPlaylistUrl,
-                                            result.m3u8Url
+                                            resolved.resolution
                                         )
                                     } else {
                                         isError = true

@@ -27,6 +27,25 @@ object StripchatApi {
     private const val TAG = "StripchatApi"
 
     /**
+     * 跨请求共享的会话 CookieJar。
+     * Stripchat 的真实直播 pkey 往往只在"带会话"的请求里出现于 Master 的
+     * #EXT-X-MOUFLON 行；匿名请求会被降级为预览片。把页面请求设置的 cookie
+     * 复用到 m3u8 请求，才能从 Master 里取到 pkey。
+     */
+    // 内部可见：供 LLHlsRecorder 的分片下载客户端复用同一会话 Cookie
+    // (Doppio CDN 在带 pkey 的 Media Playlist 响应里下发的会话 Cookie 必须随 media 分片请求回传，否则 404)
+    internal val sharedCookieJar = object : okhttp3.CookieJar {
+        private val store = java.util.concurrent.CopyOnWriteArrayList<okhttp3.Cookie>()
+        override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {
+            store.removeIf { c -> cookies.any { it.name == c.name } }
+            store.addAll(cookies)
+        }
+        override fun loadForRequest(url: okhttp3.HttpUrl): List<okhttp3.Cookie> {
+            return store.filter { it.matches(url) }
+        }
+    }
+
+    /**
      * 房间信息
      */
     data class RoomInfo(
@@ -45,6 +64,8 @@ object StripchatApi {
     data class ResolvedStream(
         override val videoPlaylistUrl: String = "",
         override val audioPlaylistUrl: String? = null,
+        /** 选中的变体分辨率字符串 (如 "1920x1080")，供下游录制修正建轨宽高 */
+        val resolution: String? = null,
         override val errorMessage: String? = null
     ) : StreamResolveResult {
         override val isSuccess: Boolean get() = videoPlaylistUrl.isNotBlank()
@@ -84,6 +105,7 @@ object StripchatApi {
             .writeTimeout(15, TimeUnit.SECONDS)
             .followRedirects(true)
             .retryOnConnectionFailure(true)
+            .cookieJar(sharedCookieJar)
 
         val proxy = detectSystemProxyFor(host)
         if (proxy != null) {
@@ -224,12 +246,9 @@ object StripchatApi {
                 return@withContext StreamResult(errorMessage = "页面数据格式异常（缺少 viewCam）")
             }
 
-            // 检查私密秀
-            if (viewCam.has("show") && !viewCam.isNull("show")) {
-                Log.w(TAG, "[2/4] ✗ 房间正在进行私密秀")
-                return@withContext StreamResult(errorMessage = "房间正在进行私密秀")
-            }
-
+            // 说明: viewCam.show 字段在公开直播与私密直播中都存在(描述当前场次元信息),
+            // 不能仅凭其非空就判定为私密秀, 否则公开房间会被误杀。
+            // 私密秀改由下方 model.status == "private" 统一判定。
             // 检查直播状态
             val model = viewCam.optJSONObject("model")
             if (model == null) {
@@ -251,6 +270,9 @@ object StripchatApi {
                     roomStatus = status
                 )
             }
+
+            val liveStatus = model.optString("status", "unknown")
+            Log.d(TAG, "[2/4] ✓ 房间正在直播 (status=$liveStatus), 进入取流流程")
 
             // 获取 model_id
             val modelId = model.optLong("id", 0)
@@ -469,10 +491,53 @@ object StripchatApi {
                 val origin = "${m3u8Url.substringBefore("://")}://${m3u8Url.substringAfter("://").substringBefore("/")}"
                 val lines = body.lines()
 
+                // 提取真实直播 pkey：Stripchat 的直播流地址必须带 pkey(+playlistType=lowLatency)
+                // 参数，否则 CDN 只回一段循环的预览/宣传片(ENDLIST + 6 个 cpa/v2 静态分片)。
+                // pkey 位于 Master Playlist 顶部自定义标签: #EXT-X-MOUFLON:PSCH:v2:<pkey>
+                val mouflonMatch = Regex("""#EXT-X-MOUFLON:PSCH:(v\d+):([^\s\r\n]+)""").find(body)
+                val psch = mouflonMatch?.groupValues?.getOrNull(1)
+                val pkey = mouflonMatch?.groupValues?.getOrNull(2)
+                if (pkey != null) {
+                    Log.w(TAG, "  [MOUFLON] 在 Master 中发现真实直播 pkey: ${pkey.take(8)}..., psch=${psch ?: "v2"}")
+                } else {
+                    Log.w(TAG, "  [MOUFLON] Master 中未发现 pkey 行 (匿名/无会话请求可能被降级为预览片)")
+                }
+
+                // 给变体拼接直播参数(pkey 来自上方 MOUFLON 行)。无 pkey 时原样返回。
+                fun buildLiveUrl(base: String): String {
+                    if (pkey == null) return base
+                    // Master 变体 URI 可能已自带 ?playlistType=standard 等查询参数。
+                    // 若直接追加 &playlistType=lowLatency，会产生 playlistType 双值冲突
+                    // (playlistType=standard&playlistType=lowLatency)，服务器取首个 standard
+                    // → 返回非 LL-HLS 列表(无 #EXT-X-PART) → 只能下整段 → Doppio 源站整段不存在 → 全 404。
+                    // 故丢弃变体自带查询，统一用直播参数重建为干净的 ?playlistType=lowLatency&...
+                    val path = base.substringBefore("?")
+                    return "${path}?playlistType=lowLatency&psch=${psch ?: "v2"}&preferredVideoCodec=avc1&pkey=$pkey"
+                }
+
                 var bestBw = -1
                 var videoUrl: String? = null
+                var bestRes: String? = null
                 var audioUrl: String? = null
                 var audioGroupId: String? = null
+
+                // 优先 H.264/AVC：Android MediaMuxer 对 AV1/HEVC 封装支持差，选到会录坏。
+                // 单独记录 AVC 池里的最高带宽变体，最后若有 AVC 则优先采用。
+                var avcBw = -1
+                var avcVideoUrl: String? = null
+                var avcBestRes: String? = null
+                var avcAudioGroupId: String? = null
+
+                // 真实"直播变体"池：带 playlistType=lowLatency / pkey / _HLS_msn 或 _NNNp 后缀的才是真直播，
+                // 裸 base room m3u8(预览/回放 VOD)会被排除，避免录到宣传广告。
+                var liveBw = -1
+                var liveVideoUrl: String? = null
+                var liveRes: String? = null
+                var liveAudioGroupId: String? = null
+                var avcLiveBw = -1
+                var avcLiveVideoUrl: String? = null
+                var avcLiveBestRes: String? = null
+                var avcLiveAudioGroupId: String? = null
 
                 var i = 0
                 while (i < lines.size) {
@@ -481,17 +546,60 @@ object StripchatApi {
                         val attrs = parseAttributes(line)
                         val bw = attrs["BANDWIDTH"]?.toIntOrNull() ?: 0
                         val resolution = attrs["RESOLUTION"]  // e.g., "1920x1080"
+                        val codecs = attrs["CODECS"] ?: ""
+                        val isAvc = codecs.contains("avc", ignoreCase = true)
+                                || codecs.contains("h264", ignoreCase = true)
+                                || codecs.contains("h.264", ignoreCase = true)
                         i++
                         val url = lines.getOrNull(i)?.trim() ?: ""
-                        val fullUrl = resolveUrl(url, origin, baseUrl)
+                        var fullUrl = resolveUrl(url, origin, baseUrl)
+                        // 若 Master 携带真实直播 pkey，则为每个变体追加直播参数，
+                        // 否则 CDN 只会回预览/宣传片(ENDLIST + cpa/v2 静态分片)。
+                        if (pkey != null) {
+                            fullUrl = buildLiveUrl(fullUrl)
+                        }
 
-                        Log.d(TAG, "  候选变体: ${resolution ?: "?"} ${bw / 1000}kbps -> $fullUrl")
-                        // 选最高带宽
+                        // 标签内容日志：打印完整原始标签行与解析出的全部属性
+                        Log.d(TAG, "  [标签] $line")
+                        Log.d(TAG, "  [标签属性] BANDWIDTH=${attrs["BANDWIDTH"]} RESOLUTION=${attrs["RESOLUTION"]} " +
+                                "CODECS=${attrs["CODECS"]} FRAME-RATE=${attrs["FRAME-RATE"]} AUDIO=${attrs["AUDIO"]}")
+                        Log.d(TAG, "  候选变体: ${resolution ?: "?"} ${bw / 1000}kbps codec=${codecs.take(40)} -> $fullUrl")
+                        // 选最高带宽（全局）
                         if (bw > bestBw) {
                             bestBw = bw
                             videoUrl = fullUrl
+                            bestRes = resolution
                             audioGroupId = attrs["AUDIO"]
-                            Log.d(TAG, "    ★ 当前最佳")
+                            Log.d(TAG, "    ★ 当前全局最佳: ${resolution ?: "?"} ${bw / 1000}kbps")
+                        }
+                        // 仅记录 AVC 池里的最高带宽
+                        if (isAvc && bw > avcBw) {
+                            avcBw = bw
+                            avcVideoUrl = fullUrl
+                            avcBestRes = resolution
+                            avcAudioGroupId = attrs["AUDIO"]
+                            Log.d(TAG, "    ★ 当前 AVC 最佳: ${resolution ?: "?"} ${bw / 1000}kbps")
+                        }
+                        // 是否"真实直播变体"：拿到 pkey 即认为 Master 里所有变体都是直播流
+                        // (已通过 buildLiveUrl 拼好 pkey 参数)；拿不到 pkey 则一律视为预览/回放，
+                        // 避免录到宣传广告。
+                        val live = pkey != null
+                        Log.d(TAG, "  [变体类型] ${if (live) "直播(LL-HLS,pkey)" else "预览/回放(VOD)"} $fullUrl")
+                        if (live) {
+                            if (bw > liveBw) {
+                                liveBw = bw
+                                liveVideoUrl = fullUrl
+                                liveRes = resolution
+                                liveAudioGroupId = attrs["AUDIO"]
+                                Log.d(TAG, "    ★ 当前直播最佳: ${resolution ?: "?"} ${bw / 1000}kbps")
+                            }
+                            if (isAvc && bw > avcLiveBw) {
+                                avcLiveBw = bw
+                                avcLiveVideoUrl = fullUrl
+                                avcLiveBestRes = resolution
+                                avcLiveAudioGroupId = attrs["AUDIO"]
+                                Log.d(TAG, "    ★ 当前 AVC 直播最佳: ${resolution ?: "?"} ${bw / 1000}kbps")
+                            }
                         }
                     } else if (line.startsWith("#EXT-X-MEDIA:") && line.contains("TYPE=AUDIO")) {
                         val attrs = parseAttributes(line)
@@ -500,7 +608,8 @@ object StripchatApi {
                         val language = attrs["LANGUAGE"] ?: "?"
                         if (uri != null) {
                             val fullUrl = resolveUrl(uri, origin, baseUrl)
-                            Log.d(TAG, "  音轨: lang=$language group=$gid -> $fullUrl")
+                            Log.d(TAG, "  [音轨标签] $line")
+                            Log.d(TAG, "  音轨: lang=$language group=$gid uri=$uri -> $fullUrl")
                             // 优先匹配与视频流相同的 GROUP-ID，否则选第一个
                             if (audioUrl == null || (audioGroupId != null && gid == audioGroupId)) {
                                 audioUrl = fullUrl
@@ -510,15 +619,53 @@ object StripchatApi {
                     i++
                 }
 
+                // 优先真实直播变体(带 playlistType=lowLatency / pkey 的 LL-HLS 变体)；
+                // 明确拒绝预览片(VOD, 裸 base room m3u8)，避免录到宣传广告。
+                if (avcLiveVideoUrl != null) {
+                    Log.w(TAG, "  ◆ 优先选择 AVC 直播变体 (真实直播流, 避免 AV1 无法封装): ${avcLiveBestRes ?: "?"} ${avcLiveBw / 1000}kbps")
+                    videoUrl = avcLiveVideoUrl
+                    bestRes = avcLiveBestRes
+                    audioGroupId = avcLiveAudioGroupId
+                } else if (liveVideoUrl != null) {
+                    Log.w(TAG, "  ◆ 选择直播变体 (真实直播流): ${liveRes ?: "?"} ${liveBw / 1000}kbps")
+                    videoUrl = liveVideoUrl
+                    bestRes = liveRes
+                    audioGroupId = liveAudioGroupId
+                } else {
+                    // 拿到的全是预览片/回放(VOD)，没有真实直播变体 → 明确报错，不录广告
+                    if (videoUrl == null && avcVideoUrl == null) {
+                        Log.e(TAG, "  ✗ 未找到任何视频流变体(播放列表并非 Master)")
+                        return@withContext ResolvedStream(errorMessage = "未找到视频流")
+                    }
+                    if (pkey == null) {
+                        // Master 里没有 #EXT-X-MOUFLON 行 = 没拿到真实直播 pkey。
+                        // 通常是匿名/无会话请求被降级；需带有效会话(登录 cookie)或后续从页面 JSON 取 pkey。
+                        Log.e(TAG, "  ✗ 未获取到真实直播 pkey：Master 中无 #EXT-X-MOUFLON 行（匿名/无会话请求被降级为预览片）")
+                        Log.e(TAG, "  ✗ 预览变体示例: ${videoUrl ?: avcVideoUrl}")
+                        return@withContext ResolvedStream(
+                            errorMessage = "未获取到真实直播流 pkey（Master 无 MOUFLON 行；可能需带会话 cookie，或后续从页面 JSON 取 pkey）"
+                        )
+                    }
+                    Log.e(TAG, "  ✗ 未发现真实直播变体：解析到的变体均为预览片/回放(VOD)，拒绝录制宣传广告")
+                    Log.e(TAG, "  ✗ 预览变体示例: ${videoUrl ?: avcVideoUrl}")
+                    return@withContext ResolvedStream(errorMessage = "未获取到真实直播流（仅预览片/回放，房间可能未真正开播）")
+                }
+
                 if (videoUrl != null) {
                     Log.w(TAG, "══════ Stripchat 取流完成 ══════")
-                    Log.w(TAG, "  ✓ Video Media Playlist: $videoUrl")
+                    Log.w(TAG, "  ✓ 最终视频流地址 (分辨率=${bestRes ?: "未知"}): $videoUrl")
                     if (audioUrl != null) {
-                        Log.w(TAG, "  ✓ Audio Media Playlist: $audioUrl")
+                        Log.w(TAG, "  ✓ 音频流地址: $audioUrl")
                     } else {
                         Log.w(TAG, "  ○ 无独立音频轨")
                     }
-                    ResolvedStream(videoPlaylistUrl = videoUrl, audioPlaylistUrl = audioUrl)
+                    Log.w(TAG, "  ○ Master 回看: $m3u8Url")
+                    Log.w(TAG, "═════════════════════════════════════")
+                    ResolvedStream(
+                        videoPlaylistUrl = videoUrl,
+                        audioPlaylistUrl = audioUrl,
+                        resolution = bestRes
+                    )
                 } else {
                     Log.e(TAG, "  ✗ 未找到视频流")
                     ResolvedStream(errorMessage = "未找到视频流")

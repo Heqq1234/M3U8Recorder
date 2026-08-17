@@ -69,10 +69,20 @@ object DownloadManager {
                 builder.header("Referer", "https://chaturbate.com/")
             }
 
-            // Stripchat / 白标站点 CDN 自动添加 Referer
-            if (url.contains("doppiocdn.com") || url.contains("edge-hls") ||
+            // Stripchat / 白标站点 CDN：media 分片必须回传与页面同源的 Referer + Origin 才能 200，
+            // 否则裸 URL 请求直接 404（playlist 因 URL 带 pkey 故能下；init 段是公开文件故能下 ——
+            // 这正是此前录出 3KB 空壳的原因）。devtools 抓包证实浏览器成功请求带：
+            //   referer: https://zh.stripchat.com/    origin: https://zh.stripchat.com
+            //   sec-fetch-*: cors / cross-site / empty
+            // 原拦截器只用 apex 域 https://stripchat.com/ 且缺 Origin，故分片 404。这里镜像浏览器。
+            // 注：仅匹配 stripchat/doppiocdn/hotzcam 等域名，Chaturbate(highwebmedia/chaturbate/mmcdn)不受影响。
+            if (url.contains("doppiocdn.net") || url.contains("doppiocdn.com") || url.contains("edge-hls") ||
                 url.contains("stripchat") || url.contains("hotzcam")) {
-                builder.header("Referer", "https://stripchat.com/")
+                builder.header("Referer", "https://zh.stripchat.com/")
+                    .header("Origin", "https://zh.stripchat.com")
+                    .header("Sec-Fetch-Dest", "empty")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("Sec-Fetch-Site", "cross-site")
             }
 
             chain.proceed(builder.build())
@@ -321,7 +331,9 @@ object DownloadManager {
         audioTrackUrl: String? = null,
         platform: String? = null,
         roomSlug: String? = null,
-        roomBaseUrl: String? = null
+        roomBaseUrl: String? = null,
+        /** 真实变体分辨率(如 "1920x1080")，仅直播分支使用，用于修正录制建轨宽高；不传则不变 */
+        selectedResolution: String? = null
     ) {
         CoroutineScope(Dispatchers.IO).launch {
             if (isLive) {
@@ -339,9 +351,10 @@ object DownloadManager {
                         // 保存平台信息，重试时可重新取流(旧 URL 会过期)
                         platform = platform,
                         roomSlug = roomSlug,
-                        roomBaseUrl = roomBaseUrl
+                        roomBaseUrl = roomBaseUrl,
+                        selectedResolution = selectedResolution
                     )
-                    Log.d(TAG, "addTask (live direct): ${task.id} platform=$platform audio=${audioTrackUrl != null}")
+                    Log.d(TAG, "addTask (live direct): ${task.id} platform=$platform audio=${audioTrackUrl != null} resolution=${selectedResolution ?: "null"}")
                     currentTasksState[task.id] = task
                     notifyQueueChanged()
                     LiveRecordingService.startService(appContext, task)

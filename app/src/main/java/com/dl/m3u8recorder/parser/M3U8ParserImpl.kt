@@ -29,8 +29,16 @@ class M3U8ParserImpl : M3U8ParserInterface {
         if (variants.isEmpty()) {
             throw IllegalArgumentException("变体列表不能为空")
         }
-        return variants.maxByOrNull { it.bandwidth }
-            ?: variants.first()
+        // 优先 H.264/AVC 变体：Android MediaMuxer 对 AV1/HEVC 封装支持差。
+        // 若池中无 AVC 变体（如仅 AV1），则退化为全局最高带宽。
+        val avc = variants.filter {
+            val c = it.codecs ?: ""
+            c.contains("avc", ignoreCase = true)
+                    || c.contains("h264", ignoreCase = true)
+                    || c.contains("h.264", ignoreCase = true)
+        }
+        val pool = if (avc.isNotEmpty()) avc else variants
+        return pool.maxByOrNull { it.bandwidth } ?: pool.first()
     }
 
     override fun parseResolution(resString: String): Resolution? {
@@ -182,6 +190,37 @@ class M3U8ParserImpl : M3U8ParserInterface {
         var isDiscontinuity = false
         var pendingPdtMs: Long? = null  // 待挂载到下一个 segment 的墙钟时间(毫秒)
 
+        // Stripchat / Doppio CDN 自定义标签：真实分片 URI 藏在 #EXT-X-MOUFLON:URI: 里，
+        // 而标准 #EXT-X-PART / #EXTINF 的 URI 只是 media.mp4 占位符。
+        // 解析到 MOUFLON 时暂存真实 URI，交给紧随其后的 PART / 分片 URI 行消费。
+        // Stripchat / Doppio 真实分片 URI 来源：#EXT-X-MOUFLON 给出的「整段基址」（去 .mp4），
+        // 用于推导 _partN 分块；或 MOUFLON 直接给出的带 _partN 的 part URI。
+        // 二者皆为空时回退 playlist 标准 URI（Chaturbate / VOD 正常路径，无 MOUFLON 故零影响）。
+        var pendingSegmentMouflonBase: String? = null
+        var pendingPartMouflonUri: String? = null
+        // 已 flush 进 parts 列表、待随后 MOUFLON 修正的诱饵 part 数量（MOUFLON 出现在整段 URI 行之后时用到）
+        var pendingDecoyPartTailCount = 0
+        // 注意：MOUFLON 里的真实分片 URI 是干净的绝对 URL、不带任何查询参数。
+        // 浏览器/HLS 播放器对 media 分片请求也用的是裸 URL（已用 devtools 抓包证实：
+        // 成功响应 :path 无 ?pkey），鉴权靠的是 Referer/Origin 请求头而非 URL 参数。
+        // 因此这里【不要】给 URI 补 playlist 查询参数（补了反而与浏览器不一致）。
+        // 仅作用于 #EXT-X-MOUFLON 标签（Stripchat/Doppio 专属），Chaturbate 无此标签故完全不受影响。
+        // 因 #EXTINF 与真实 URI 行之间可能隔着 MOUFLON，故 EXTINF 先存待定时长/PDT，
+        // 待真正的 URI 行到达时再生成 Segment。
+        var pendingExtinfDuration: Double? = null
+        var pendingExtinfPdt: Long? = null
+
+        // 从变体 playlist URL 提取画质标记(如 720p_h264 / 960p60_av1)，用于补齐 MOUFLON 真实 URI 缺失的画质段。
+        // 例：.../228961321_720p_h264.m3u8?... -> "720p_h264"。仅作用于 MOUFLON(Stripchat 专属)，Chaturbate 无 MOUFLON 故不影响。
+        val quality = extractQuality(baseUrl)
+        if (quality != null) {
+            Log.d(TAG, "MOUFLON 画质标记(从变体 URL 提取): $quality")
+        }
+        // 最近创建的 segment / part 是否仍是诱饵 URI(待随后的 MOUFLON 覆盖)。
+        // 处理"MOUFLON 在 segment/part 诱饵行之后"的顺序(Sample: pl.m3u8 为 MOUFLON 在前，部分真机 playlist 为 MOUFLON 在后)。
+        var lastSegmentWasDecoy = false
+        var lastPartWasDecoy = false
+
         val lines = content.lines()
 
         // 检测是否为 LL-HLS
@@ -252,17 +291,89 @@ class M3U8ParserImpl : M3U8ParserInterface {
                     partTargetDuration = attrs["PART-TARGET"]?.toDoubleOrNull() ?: 0.0
                 }
 
+                // #EXT-X-MOUFLON (Stripchat / Doppio CDN 自定义标签：携带真实分片 URI 或 PSCH 令牌)
+                line.startsWith("#EXT-X-MOUFLON:") -> {
+                    val body = line.substringAfter("#EXT-X-MOUFLON:")
+                    if (body.startsWith("URI:")) {
+                        val raw = body.substringAfter("URI:").trim()
+                        if (raw.isNotEmpty()) {
+                            // v2 (PSCH) 加密：MOUFLON URI 的 token 段是密文，直接请求必 404。
+                            // 先用 pkey 对应密钥解密 token 替换为真实地址（无密钥/解密失败时原样返回，
+                            // 回退为现状行为）；解密后的 URI 已是完整可下载形态（实测下载 200）。
+                            // 归一化：补齐画质标记(从变体 URL 提取)与 .mp4 后缀。devtools 实测真实分片 URL 形如
+                            // {room}_{seq}_{token}_{ts}[_partN].mp4；MOUFLON 给的真实 URI 可能是整段基址(无 _partN)。
+                            val resolved = resolveUrl(raw, baseUrl)
+                            val decrypted = MouflonCrypto.decryptUri(resolved, baseUrl)
+                            if (decrypted != resolved) {
+                                Log.d(TAG, "MOUFLON token 解密成功: ${decrypted.substringAfterLast('/').take(80)}")
+                            }
+                            val normalized = normalizeMouflonUri(decrypted, quality)
+                            Log.d(TAG, "MOUFLON 捕获真实分片 URI: ${normalized.take(90)}")
+                            if (isPartUri(normalized)) {
+                                // MOUFLON 直接给出带 _partN 的 part URI：留给紧随其后的 #EXT-X-PART 消费
+                                pendingPartMouflonUri = normalized
+                                pendingSegmentMouflonBase = null
+                            } else {
+                                // MOUFLON 给出整段基址（如 …_6875_<token>_<ts>，ts 段是服务端真实值，
+                                // 通常就是该 segment 的 PDT 墙钟时间戳；注意日志用 take(90) 会把长 ts 截断成
+                                // 看似 "_1" 的假象，实际 normalized 变量是完整字符串）。
+                                // 真实 PART 分块 URL = 基址在 .mp4 前插入 "_partN"。
+                                // 优先用 MOUFLON 基址推导，可规避 playlist 的 #EXT-X-PART URI 偶尔是
+                                // media.mp4 占位符的情况；与直接用 PART URI 属性等价（二者 ts 一致）。
+                                val base = normalized.removeSuffix(".mp4")
+                                pendingSegmentMouflonBase = base
+                                pendingPartMouflonUri = null
+                                // MOUFLON-after（出现在整段 URI 行之后）：修正已 flush 的最后一个诱饵 segment
+                                if (segments.isNotEmpty() && lastSegmentWasDecoy) {
+                                    val idx = segments.lastIndex
+                                    segments[idx] = segments[idx].copy(uri = "$base.mp4")
+                                    lastSegmentWasDecoy = false
+                                }
+                                // MOUFLON-after（出现在 parts 之后、整段 URI 行之前）：修正已缓存的全部诱饵 part
+                                if (currentSegmentParts.isNotEmpty() && lastPartWasDecoy) {
+                                    val fixed = currentSegmentParts.map { p ->
+                                        p.copy(uri = derivePartUri(base, p.partIndex))
+                                    }
+                                    currentSegmentParts.clear()
+                                    currentSegmentParts.addAll(fixed)
+                                    lastPartWasDecoy = false
+                                }
+                                // MOUFLON-after（出现在整段 URI 行之后）：parts 列表尾部已是本 segment 的诱饵 part，统一修正
+                                if (pendingDecoyPartTailCount > 0 && parts.size >= pendingDecoyPartTailCount) {
+                                    val start = parts.size - pendingDecoyPartTailCount
+                                    for (i in start until parts.size) {
+                                        parts[i] = parts[i].copy(uri = derivePartUri(base, parts[i].partIndex))
+                                    }
+                                    pendingDecoyPartTailCount = 0
+                                }
+                            }
+                        }
+                    }
+                    // PSCH:v2:xxx 等子类型忽略
+                }
+
                 // #EXT-X-PART (LL-HLS partial segment)
                 line.startsWith("#EXT-X-PART:") -> {
                     val attrs = parseAttributes(line.substringAfter(":"))
-                    val uri = attrs["URI"]?.let { resolveUrl(it, baseUrl) } ?: continue
+                    val partIndex = currentPartIndex
+                    // 优先用 MOUFLON 真实 URI：① 直接给的带 _partN 的 part URI；② 整段基址推导 _partN；
+                    // 否则回退 playlist 的 #EXT-X-PART URI（LL-HLS 下通常即真实 part 地址，ts 与 MOUFLON 一致；
+                    // 仅当它是 media.mp4 占位符时才靠上面 MOUFLON-after 修正）。
+                    val uri = pendingPartMouflonUri
+                        ?: (pendingSegmentMouflonBase?.let { derivePartUri(it, partIndex) })
+                        ?: attrs["URI"]?.let { resolveUrl(it, baseUrl) }
+                        ?: continue
+                    val usedReal = pendingPartMouflonUri != null || pendingSegmentMouflonBase != null
+                    pendingPartMouflonUri = null
+                    lastPartWasDecoy = !usedReal
                     currentSegmentParts.add(Part(
                         duration = attrs["DURATION"]?.toDoubleOrNull() ?: 0.0,
                         uri = uri,
                         independent = attrs["INDEPENDENT"] == "YES",
                         gap = attrs["GAP"] == "YES",
-                        partIndex = currentPartIndex++
+                        partIndex = partIndex
                     ))
+                    currentPartIndex++
                 }
 
                 // #EXT-X-PRELOAD-HINT (LL-HLS)
@@ -298,65 +409,56 @@ class M3U8ParserImpl : M3U8ParserInterface {
                     pendingPdtMs = parsePdtToMillis(line.substringAfter(":").trim())
                 }
 
-                // #EXTINF (segment duration + URI)
+                // #EXTINF (segment duration + URI；真实 URI 可能在后续 MOUFLON 之后，故先存待定)
                 line.startsWith("#EXTINF:") -> {
                     val durationStr = line.substringAfter(":").substringBefore(",")
                     val duration = durationStr.toDoubleOrNull() ?: 0.0
-                    val title = line.substringAfter(",", "").trim().ifEmpty { null }
+                    pendingExtinfDuration = duration
+                    pendingExtinfPdt = pendingPdtMs
+                    pendingPdtMs = null
+                    // 真正的分片 URI 行（可能隔着 MOUFLON）在下方 URI 分支处理
+                }
 
-                    val nextLine = lines.getOrNull(i + 1)?.trim() ?: ""
-
-                    if (nextLine.isNotEmpty() && !nextLine.startsWith("#")) {
-                        val uri = resolveUrl(nextLine, baseUrl)
-
-                        // 绑定 part 与当前 segment 的序号和 PDT
+                // 直接的 URI 行（#EXTINF 之后的真实分片 URI，或兼容无 EXTINF 的情况）
+                !line.startsWith("#") && line.isNotEmpty() -> {
+                    // 优先用 MOUFLON 整段基址（Stripchat 真实取片地址）；否则用本行 URI（Chaturbate/VOD 正常路径）。
+                    val realUri = (pendingSegmentMouflonBase?.let { "$it.mp4" })
+                        ?: pendingPartMouflonUri
+                        ?: resolveUrl(line, baseUrl)
+                    val usedReal = pendingSegmentMouflonBase != null || pendingPartMouflonUri != null
+                    pendingSegmentMouflonBase = null
+                    pendingPartMouflonUri = null
+                    // 若用的是诱饵 URI(非 MOUFLON)，标记待随后的 MOUFLON 覆盖
+                    lastSegmentWasDecoy = !usedReal
+                    val duration = pendingExtinfDuration ?: targetDuration
+                    val pdt = pendingExtinfPdt ?: pendingPdtMs
+                    pendingExtinfDuration = null
+                    pendingExtinfPdt = null
+                    pendingPdtMs = null
+                    // 避免与 #EXTINF 处理重复添加同一 segment（比较已解析的完整 URI）
+                    if (segments.isEmpty() || segments.last().uri != realUri) {
+                        // 绑定剩余未绑定的 part
                         currentSegmentParts.forEach { part ->
                             parts.add(part.copy(
                                 sequenceNumber = currentSeq,
-                                programDateTimeMs = pendingPdtMs
+                                programDateTimeMs = pdt
                             ))
                         }
+                        // 记录本 segment 的 part 数，若它们是诱饵（MOUFLON 在 URI 行之后才到），
+                        // 待随后 MOUFLON 出现时修正 parts 列表尾部。
+                        pendingDecoyPartTailCount = if (lastPartWasDecoy) currentSegmentParts.size else 0
+                        lastPartWasDecoy = false
                         currentSegmentParts.clear()
                         currentPartIndex = 0
 
                         segments.add(Segment(
                             duration = duration,
-                            uri = uri,
-                            title = title,
+                            uri = realUri,
                             discontinuity = isDiscontinuity,
                             key = currentEncryptionKey,
                             sequenceNumber = currentSeq++,
-                            programDateTimeMs = pendingPdtMs
+                            programDateTimeMs = pdt
                         ))
-                        pendingPdtMs = null
-                        isDiscontinuity = false
-                    }
-                }
-
-                // 直接的 URI 行（没有 EXTINF，兼容性处理）
-                !line.startsWith("#") && line.isNotEmpty() -> {
-                    val uri = resolveUrl(line, baseUrl)
-                    // 避免与 #EXTINF 处理重复添加同一 segment（比较已解析的完整 URI）
-                    if (segments.isEmpty() || segments.last().uri != uri) {
-                        // 绑定剩余未绑定的 part
-                        currentSegmentParts.forEach { part ->
-                            parts.add(part.copy(
-                                sequenceNumber = currentSeq,
-                                programDateTimeMs = pendingPdtMs
-                            ))
-                        }
-                        currentSegmentParts.clear()
-                        currentPartIndex = 0
-
-                        segments.add(Segment(
-                            duration = targetDuration,
-                            uri = uri,
-                            discontinuity = isDiscontinuity,
-                            key = currentEncryptionKey,
-                            sequenceNumber = currentSeq++,
-                            programDateTimeMs = pendingPdtMs
-                        ))
-                        pendingPdtMs = null
                         isDiscontinuity = false
                     }
                 }
@@ -456,6 +558,59 @@ class M3U8ParserImpl : M3U8ParserInterface {
             result[key] = value
         }
 
+        return result
+    }
+
+    /**
+     * 从变体 playlist URL 提取画质标记(如 720p_h264 / 960p60_av1 / 240p)。
+     * 例：https://media-hls.doppiocdn.net/b-hls-20/228961321/228961321_720p_h264.m3u8?... -> "720p_h264"
+     * 仅用于 MOUFLON 真实 URI 的画质段补齐(Stripchat/Doppio CDN)。无则返回 null。
+     */
+    private fun extractQuality(baseUrl: String): String? {
+        // 画质标记：2~4 位数字 + 'p' + 可选帧率数字 + 可选 "_编解码器"
+        val m = Regex("""(\d{2,4}p\d*(?:_[a-zA-Z0-9]+)?)""").find(baseUrl) ?: return null
+        return m.groupValues[1].takeIf { it.contains("p") }
+    }
+
+    /**
+     * 判断归一化后的 URI 是否为 partial segment(带 _partN)。
+     */
+    private fun isPartUri(uri: String): Boolean {
+        return Regex(""".*_part\d+(?:\.mp4)?$""").matches(uri)
+    }
+
+    /**
+     * 由整段基址(去 .mp4)推导 partial segment URL：在 .mp4 前插入 _partN。
+     * 仅用于 Stripchat / Doppio（MOUFLON 给出整段基址、PART 分块需自行拼接）。
+     */
+    private fun derivePartUri(base: String, partIndex: Int): String {
+        val b = base.removeSuffix(".mp4")
+        return "${b}_part${partIndex}.mp4"
+    }
+
+    /**
+     * 归一化 MOUFLON 真实分片 URI：
+     *  1) 若缺画质标记(如 720p_h264 / 960p60_av1)，在房间号之后注入(从变体 URL 提取的 quality)；
+     *  2) 补 .mp4 后缀(真实分片必须有扩展名)。
+     * devtools 实测真实 URL 形如 {room}_{quality}_{seq}_{token}_{ts}[_partN].mp4。
+     * 仅作用于 MOUFLON(Stripchat 专属)，Chaturbate 无 MOUFLON 故完全不受影响。
+     */
+    private fun normalizeMouflonUri(uri: String, quality: String?): String {
+        var result = uri.trim()
+        val filename = result.substringAfterLast("/")
+        // 1) 注入画质标记
+        if (quality != null && !filename.contains(Regex("""\d{2,4}p"""))) {
+            val room = filename.substringBefore("_")            // 房间号, 如 256819146
+            val needle = "${room}_"
+            if (filename.startsWith(needle) && !filename.startsWith("${room}_$quality")) {
+                val newFilename = filename.replaceFirst(needle, "${room}_${quality}_")
+                result = "${result.substringBeforeLast("/")}/$newFilename"
+            }
+        }
+        // 2) 补 .mp4 后缀
+        if (!result.endsWith(".mp4")) {
+            result = "$result.mp4"
+        }
         return result
     }
 
