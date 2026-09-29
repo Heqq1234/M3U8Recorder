@@ -61,9 +61,14 @@ data class DownloadTask(
     val scheduledStartTime: Long = 0L,
 
     // 定时任务到期重新取流用(主播未开播重试)。手动URL分支不填。
-    val platform: String? = null,       // "chaturbate" | "stripchat" | null
+    val platform: String? = null,       // "chaturbate" | "stripchat" | "cams" | null
     val roomSlug: String? = null,       // 房间 slug
-    val roomBaseUrl: String? = null     // stripchat 的 baseUrl(chaturbate 不用)
+    val roomBaseUrl: String? = null,    // stripchat 的 baseUrl(chaturbate 不用)
+
+    // Cams.com 成员模式(FHD)字段：带 Bearer JWT 时走 viewers 端点取高画质源
+    val camsBearerToken: String? = null, // 登录态 Bearer(JWT)，匿名留空=360p
+    val camsViewer: String? = null,      // JWT 中的 username(会员账号)
+    val camsUid: String? = null          // JWT 中的 uid(会话 id)
 
 ) : Parcelable {
 

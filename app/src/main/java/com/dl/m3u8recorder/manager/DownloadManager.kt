@@ -10,6 +10,7 @@ import com.dl.m3u8recorder.downloader.M3U8Downloader
 import com.dl.m3u8recorder.llhls.ChaturbateApi
 import com.dl.m3u8recorder.llhls.LLHlsRecorder
 import com.dl.m3u8recorder.llhls.StripchatApi
+import com.dl.m3u8recorder.llhls.CamsApi
 import com.dl.m3u8recorder.merger.FFmpegStreamMerger
 import com.dl.m3u8recorder.model.DownloadTask
 import com.dl.m3u8recorder.parser.M3U8ParserImpl
@@ -83,6 +84,13 @@ object DownloadManager {
                     .header("Sec-Fetch-Dest", "empty")
                     .header("Sec-Fetch-Mode", "cors")
                     .header("Sec-Fetch-Site", "cross-site")
+            }
+
+            // Cams.com CDN：分片在 camshls.cams.com（实测域名，StreaMonitor 旧域名 camscdn 已弃用），
+            // 补同源 Referer（与页面同源，避免反盗链 403/404；无 Cookie、无需登录态）。
+            // 独立于 stripchat 分支，不影响其它站点。
+            if (url.contains("camshls.cams.com")) {
+                builder.header("Referer", "https://cams.com/")
             }
 
             chain.proceed(builder.build())
@@ -179,6 +187,15 @@ object DownloadManager {
                         }
                         StripchatApi.fetchStreamUrl(StripchatApi.RoomInfo(slug = slug, baseUrl = base))
                     }
+                    "cams" -> {
+                        val slug = task.roomSlug
+                        if (slug.isNullOrBlank()) {
+                            Log.e(TAG, "cams 定时任务缺 roomSlug，放弃")
+                            markRetryExhausted(task, "配置错误：缺少房间号")
+                            return@launch
+                        }
+                        CamsApi.fetchStreamUrl(slug)
+                    }
                     else -> {
                         Log.e(TAG, "未知 platform: ${task.platform}，放弃")
                         markRetryExhausted(task, "配置错误：未知平台")
@@ -205,6 +222,7 @@ object DownloadManager {
                 val resolved = when (task.platform) {
                     "chaturbate" -> ChaturbateApi.resolveMasterPlaylist(fetchResult.m3u8Url)
                     "stripchat" -> StripchatApi.resolveMasterPlaylist(fetchResult.m3u8Url, task.roomBaseUrl)
+                    "cams" -> CamsApi.resolveMasterPlaylist(fetchResult.m3u8Url)
                     else -> null
                 }
                 if (resolved == null || resolved.videoPlaylistUrl.isBlank()) {
@@ -940,6 +958,7 @@ object DownloadManager {
                     "stripchat" -> StripchatApi.fetchStreamUrl(
                         StripchatApi.RoomInfo(slug = task.roomSlug!!, baseUrl = task.roomBaseUrl ?: "")
                     )
+                    "cams" -> CamsApi.fetchStreamUrl(task.roomSlug!!)
                     else -> {
                         task.statusMessage = "配置错误：未知平台 ${task.platform}"
                         task.isCancelled = true
@@ -967,6 +986,7 @@ object DownloadManager {
                 val resolved = when (task.platform) {
                     "chaturbate" -> ChaturbateApi.resolveMasterPlaylist(fetchResult.m3u8Url)
                     "stripchat" -> StripchatApi.resolveMasterPlaylist(fetchResult.m3u8Url, task.roomBaseUrl)
+                    "cams" -> CamsApi.resolveMasterPlaylist(fetchResult.m3u8Url)
                     else -> null
                 }
                 if (resolved == null || resolved.videoPlaylistUrl.isBlank()) {

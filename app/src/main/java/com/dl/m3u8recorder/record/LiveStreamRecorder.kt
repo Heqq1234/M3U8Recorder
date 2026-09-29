@@ -125,7 +125,16 @@ class LiveStreamRecorder(private val context: Context) {
         // 确保父目录存在
         outputTsFile.parentFile?.mkdirs()
         // Phase 1: 添加时间戳修正参数解决音画不同步和卡顿问题
-        val command = listOf(
+        // cams.com：ffmpeg 自带 HTTP 栈（不走 OkHttp 拦截器）。实测 SoyIrene 直播时，
+        // m3u8 与 .ts 当前均不强制 Referer（无头也可 200）；但 hls.js 真实播放器会带
+        // Referer: https://cams.com/，此处保留以匹配真实请求并防范 Akamai 规则收紧/部分地区或房间触发 403。
+        // 仅针对 cams 注入，不动其它站点逻辑；同时匹配手动粘贴 camshls 链接（platform 为 null，按 URL host 判断）。
+        val commandParts = mutableListOf<String>()
+        val needsCamsReferer = task.platform == "cams" || task.url.contains("camshls.cams.com")
+        if (needsCamsReferer) {
+            commandParts += listOf("-headers", "Referer: https://cams.com/")
+        }
+        commandParts += listOf(
             "-i", task.url,
             "-fflags", "+genpts",
             "-avoid_negative_ts", "make_zero",
@@ -137,7 +146,8 @@ class LiveStreamRecorder(private val context: Context) {
             "-max_muxing_queue_size", "1024",
             "-flush_packets", "1",
             outputTsFile.absolutePath
-        ).joinToString(" ")
+        )
+        val command = commandParts.joinToString(" ")
 
         Log.d(TAG, "开始录制命令: $command")
 
